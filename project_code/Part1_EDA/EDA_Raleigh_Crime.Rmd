@@ -1,0 +1,241 @@
+---
+title: "PART 1: EDA of Raleigh Crime"
+author: "Alexander Ng"
+date: "10/15/2021"
+output: 
+  html_document:
+    df_print: paged
+    highlight: tango
+    number_sections: yes
+    theme: readable
+    toc: yes
+    toc_depth: 2
+    toc_float: no
+    fontsize: 12
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+This module extracts and describes the Raleigh Crime Incident data to be used for Model Evaluation.
+Crime incident data is organized by `crime_category`.  Each observation has date, time, crime category and subcategory information, address,
+and geocoding information.   We find that the crime_category of ASSAULT is the most frequent and that the geocoding information is sufficiently complete to warrant the dataset's use in model building.
+
+Visual exploratory analysis will be prepared in a separate module of this EDA.
+
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(kableExtra)
+library(sf)
+library(fpp3)
+```
+
+```{r echo=FALSE}
+root_dir = "/Volumes/GDRIVE_SSD/homes/alex/datascience/698_CAPSTONE_2021_FALL/"
+
+data_dir = paste0(root_dir , "project_data/")
+
+working_dir = paste0(root_dir, "project_code/Part1_EDA/")
+
+```
+
+```{r echo=FALSE, eval=FALSE}
+# We will not parse and use CSV crime incident files.
+
+raleigh_raw = read_csv( paste0(data_dir, "Raleigh_Police_Incidents_(NIBRS).csv"))
+
+# This code is no longer used because we are not loading CSV crime data.  Sticking with geojson data files.
+
+raleigh_raw %>% filter(crime_category == 'ASSAULT') %>% select( X,Y, crime_description, crime_code, longitude, latitude, reported_year) %>% group_by(reported_year) %>%  summarize(naX = sum(is.na(X)), naY = sum(is.na(Y) ) , naLong = sum(abs(longitude) < 0.001   ), naLat = sum( abs(latitude) < 0.001 ) , n = n() , naX / n )
+
+# Not using CSV crime incident files for EDA.
+#
+raleigh_raw %>% group_by(reported_year, crime_category ) %>% summarize( n = n()) %>% 
+  pivot_wider(names_from = reported_year, values_from = n ) -> summary_raleigh_raw
+
+summary_raleigh_raw %>% arrange( desc(`2021`)) %>% kable()
+
+```
+
+## Data Gathering Process
+
+The crime incident data is furnished by the City of Raleigh, North Carolina in geojson format on its municipal open data portal.
+After download the most recent dataset, we load the geojson file and transform its coordinate system to a standard EPSG=2264 projection.
+That represents NAD83 (North Carolina) projection that is adopted for Wake County geospatial data files.
+There are over 350,000 incidents with 21 reported fields.
+
+Because the dataset is updated daily and the contents are cumulative from June 2014, the file will grow in the future.
+
+```{r}
+gj_crime = st_read( paste0(data_dir, "Raleigh_Police_Incidents_(NIBRS).geojson"))  %>% st_transform(2264)
+
+
+
+```
+
+
+```{r}
+gj_crime %>%  mutate( status = st_is_empty(geometry))  %>%   # identify that rows where geometry is empty or undefined.
+  st_drop_geometry() %>%
+  group_by(status, reported_year, crime_category ) %>% summarize( ct = n()) %>% 
+  arrange(reported_year, crime_category, status ) %>%
+  pivot_wider(names_from = status, values_from = ct ) %>% 
+  mutate( total = `FALSE` + `TRUE`,   # Total incidents geocoded or not
+          pct_valid = 100* `FALSE`/total     # geocoded valid incidents
+          ) %>%
+  rename(geocoded=`FALSE`, notgeocoded=`TRUE` ) -> gj_crime_na_status
+
+```
+
+In the table below, we observe that `ASSAULT` comprises 15.9% of total crimes in the historical dataset.
+It represents over 42,000 observations from 2014 to 2021.  This is a sufficiently rich dataset for predictive analysis.
+
+
+```{r}
+
+gj_crime_na_status %>% 
+  group_by(crime_category) %>% 
+  summarize( cnt = sum(geocoded, na.rm = TRUE) ) %>%  
+  mutate( freq = 100 * cnt/ sum(cnt, na.rm = TRUE) ) %>% 
+  arrange( desc(freq )) %>% 
+  kable(digits = 2 , caption = "Total Crimes Categories By Frequency June 2014-Aug 2021" ) %>%
+  kable_styling(bootstrap_options = c("hover", "striped"))
+
+
+```
+
+
+
+```{r}
+gj_crime_na_status %>% 
+  select(reported_year, crime_category, total) %>%  
+  pivot_wider(names_from = reported_year, values_from = total  ) %>% 
+  arrange(crime_category) %>%
+  kable(digits = 1, caption = "Count of all crimes by category across years" ) %>%
+  kable_styling( bootstrap_options = c("hover", "striped"))
+
+```
+
+
+The most important data field to check for completeness is the geometry.   If the geometry is empty or undefined, the observation cannot be used.
+Luckily for most crime_categories, we observe geocoding is over 90% complete in all years except for `SEX OFFENSES` where the geocoding is less than 31% for all years.   An important rule of thumb in the crime hotspot research literature is that a 85% geocoding completeness rate is the minimum acceptable threshold for usage.
+
+
+```{r}
+gj_crime_na_status %>% 
+  select(reported_year, crime_category, pct_valid ) %>%  
+  pivot_wider(names_from = reported_year, values_from = pct_valid ) %>% 
+  arrange(crime_category) %>%
+  kable(digits = 1, caption = "% geocoded crimes by category across years" ) %>%
+  kable_styling( bootstrap_options = c("hover", "striped"))
+
+```
+
+# Assaults
+
+Our primary goal will be to analyze and predict assaults.
+Considering only assaults, we evaluate their count and completeness of geocoding by year and month.
+We observe in the table below that assault count and geocoding data quality is consistent through all years and regimes.
+
+
+```{r}
+
+gj_crime %>% filter(crime_category == 'ASSAULT')  -> gj_assault
+
+```
+
+
+
+```{r warning=FALSE, message=FALSE}
+
+gj_assault %>% mutate( status = st_is_empty(geometry))  %>%   # identify that rows where geometry is empty or undefined.
+  st_drop_geometry() %>%     # strip out the geometry when reporting 
+  group_by(status, reported_year, reported_month) %>%   # grouped by status = TRUE mean missing geometry, FALSE means well-defined, year, month
+  summarize(ct = n()) %>%    
+  arrange(reported_year, reported_month, status) %>%   # sort by year, month and status
+  pivot_wider(names_from = status, values_from = ct ) %>%   # pivot to get TRUE , FALSE as columns.  ROWS represent year, month,  data values are counts
+  mutate( total = `FALSE` + `TRUE`,   # Total incidents geocoded or not
+          pct_valid = 100* `FALSE`/total ,    # geocoded valid incidents
+          month = formatC( reported_month, width=2, format="d", flag="0")   # change the month string to zero padded text for column sorting
+          ) -> assault_na_status
+
+gj_assault %>% filter( !st_is_empty(geometry) ) -> gj_assault_geocoded
+
+```
+
+The resulting table below shows the within month data completeness.  For each year-month, we reported the number of incidents
+which have valid geocoding divided by total incidents in that period.  The percentages belows show all periods exceed 90% data completeness.
+The median month completeness is 95.2%.   The number of assaults range from 211 to 618 in the reporting period.
+
+```{r}
+assault_na_status %>% 
+  select(reported_year, month, pct_valid ) %>% 
+  arrange(month, reported_year) %>% 
+  pivot_wider(names_from = month, values_from = pct_valid ) %>% 
+  arrange(reported_year) %>%
+  kable(digits = 1, caption="Data Completeness % of Assaults within each Month/Year") %>% 
+  kable_styling(bootstrap_options = c("hover", "striped"))
+
+```
+
+
+```{r}
+assault_na_status %>% 
+  rename( geocoded = `FALSE`) %>%
+  select(reported_year, month, geocoded ) %>% 
+  arrange(month, reported_year) %>% 
+  pivot_wider(names_from = month, values_from = geocoded ) %>% 
+  arrange(reported_year) %>%
+  kable(digits = 1, caption="Count of Geocoded Assaults within each Month/Year") %>% 
+  kable_styling(bootstrap_options = c("hover", "striped"))
+
+```
+
+
+## Visualizing Assault Frequency by Month
+
+Clearly we see that monthly assaults have some seasonality.  Since the most recent month is partial, the drop in number of assaults is expected.
+So we drop the most recent observation to evaluate trend and patterns.
+
+```{r}
+
+assault_na_status %>% head( length(assault_na_status$total) - 1 ) %>%
+  rename( geocoded = `FALSE`) %>%
+  mutate( ym = yearmonth(sprintf("%d-%0d", reported_year, reported_month) ) ) %>% 
+  as_tsibble( index = ym ) ->ts_assaults_monthly
+
+ts_assaults_monthly %>% autoplot(total) + labs(title = "Monthly Assaults in Raleigh", subtitle = "June 2014-Aug 2021")
+```
+
+We observe some seasonality in the monthly observations.
+
+```{r}
+
+ts_assaults_monthly  %>%  model(STL(geocoded )) %>% components() %>% autoplot()
+
+```
+
+```{r}
+ts_assaults_monthly %>% as_tibble() %>% select(ym, geocoded, total, pct_valid) %>% as_tsibble() %>% gg_season()
+
+```
+
+## Saving Assaults Data
+
+
+```{r}
+
+# Note that sf guesses the format of the output file from the suffix.
+
+st_write(gj_assault_geocoded ,  dsn = paste0(data_dir, "EXP_EDA_RALEIGH_assaults_Aug2021.geojson"), delete_dsn = TRUE)
+
+```
+```{r}
+
+st_write(gj_assault_geocoded %>% filter(reported_year == 2018, reported_month == 1),  dsn = paste0(data_dir, "EXP_RALEIGH_SUBSET_201801_assaults_Aug2021.geojson"), delete_dsn = TRUE)
+```

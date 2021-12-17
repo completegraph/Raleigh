@@ -1,0 +1,1057 @@
+---
+title: "Joining City Grid to Multiple Data Sources"
+author: "Alexander Ng"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output:
+  html_document:
+    df_print: paged
+    highlight: tango
+    number_sections: yes
+    theme: readable
+    toc: yes
+    toc_depth: 2
+    toc_float: no
+    fontsize: 12
+  pdf_document:
+    toc: yes
+    toc_depth: '2'
+subtitle: Production
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(kableExtra)
+library(sf)
+library(ggspatial)
+library(tigris)
+library(cowplot)
+library(lubridate)
+```
+
+# Introduction
+
+The purpose of this script is to generate the model data input files needed for model building. Exploratory data analysis and data cleaning are typically done elsewhere. The types of data that are taken as inputs are:
+
+-   Map of city boundaries
+-   Crime incident data with geocoding from City of Raleigh.
+-   Census demographic data on unemployment, household income, poverty and population density
+-   Points of interest such as retail stores, restaurants and bars.
+-   Potholes repairs by City of Raleigh
+
+The data files are exported in `geojson` or csv format:
+
+-   City of Raleigh grid map file containing the uniform square grid cells intersected with the city territory.
+
+-   Points of interest (POI A) area contained in City of Raleigh.
+
+-   Points of interest (POI) encoded as points within City of Raleigh
+
+-   A grid file of non-crime covariates whose rows are the grid cells and columns are:
+
+    -   counts of all Points of interest in each cell
+    -   unemployment, poverty and population density per cell
+    -   household income per cell
+    -   longitude, latitude, area
+    -   grid metadata - row and column indices
+
+-   A training file of crime data per grid cell
+
+-   A test file of crime data per grid cell
+
+We also export image files of city plots for using in final reporting.
+
+```{r configuration, echo = FALSE}
+#
+# used to avoid lengthy calculations of city grid.
+# We save the city grid for future data merging.
+# --------------------------------------------------
+runBigCalculations = FALSE
+
+proj_dir = "/Volumes/GDRIVE_SSD/homes/alex/datascience/698_CAPSTONE_2021_FALL"
+
+working_dir = paste0(proj_dir, "/", "project_code/Part2_GeoMapping/")
+
+data_dir = paste0(proj_dir, "/project_data/")
+
+setwd(working_dir)
+
+```
+
+
+
+```{r map-file-load}
+raleigh_corporate_limits_file = paste0(data_dir, "Corporate_Limits.geojson")
+
+cityworks_potholes_file = paste0(data_dir, "Cityworks_Potholes.geojson" )
+
+```
+
+We load the city boundary.
+
+```{r load-raleigh-boundary}
+#
+# Load the geojson files
+# change the coordinate system to 2264
+# filter objects that belong to RALEIGHT
+# --------------------------------------------
+gj_raleigh <- sf::st_read(raleigh_corporate_limits_file, quiet = TRUE) %>% 
+  st_transform(2264) %>% 
+  filter( SHORT_NAME == 'RAL' )
+
+```
+
+We load the potholes.
+
+```{r load-potholes}
+gj_potholes = sf::st_read(cityworks_potholes_file, quiet = TRUE ) %>% st_transform(2264)
+
+```
+
+
+We load a preprocessed assault data file and plot its extent over the Raleigh City boundary with a base map.
+
+```{r}
+
+gj_assault_geocoded = st_read(paste0(data_dir, "EXP_EDA_RALEIGH_assaults_Aug2021.geojson" ), quiet = TRUE )
+
+```
+
+
+# Constructing the City Grid
+
+To construct the city of Raleigh grid, we noted during exploratory data analysis that some crimes were geocoded slightly outside of city limits.  For example, a crime incident could fall inside Raleigh jurisdiction as confirmed by the street address information but the geocoded location may fall 50 feet outside  of city limits.  To include a reasonable number of such incidents, we add a fixed distance buffer of 100 feet to the boundary to include most of those crimes.
+
+Constructing a high resolution city grid is time consuming, so we save the grid to file to subsequent use and conditionally disable the code when not needed.
+
+```{r}
+gj_raleigh_buffer = st_buffer(gj_raleigh, dist = 100 ) %>% st_union() %>% st_sf() 
+
+print(paste0( "Area in miles^2 of Raleigh Buffered at 100 feet: ", st_area(st_union( gj_raleigh_buffer) ) / ( 5280^2 ) , " miles" ))
+
+```
+
+The grid cell is set below.  We use a value typically aligned with current research practice of about 1 city block.
+The grid is comprised of a uniform square tesselation of the city boundary using the grid cell size below.
+
+```{r}
+grid_cellsize = 490
+
+# We need the grid cell buffer file name for export and later import
+grid_buffer_file = paste0(data_dir, "EXP_GRID_RALEIGH_BUFFER_", grid_cellsize, ".geojson")
+
+```
+
+Let's make a `r grid_cellsize` x `r grid_cellsize` feet grid.
+
+```{r make_buffered_grid}
+
+a1buffer = st_make_valid(gj_raleigh_buffer) %>% st_make_grid(cellsize=grid_cellsize ) 
+
+raleigh_buff_bbox = st_bbox( a1buffer )
+
+# Calculate the number of rows and columns
+
+( nColsBuff = ceiling(( raleigh_buff_bbox[3] - raleigh_buff_bbox[1] ) / grid_cellsize ) )
+
+( nRowsBuff = ceiling(( raleigh_buff_bbox[4] - raleigh_buff_bbox[2] ) / grid_cellsize ) )
+
+```
+
+We add grid row and column indices constructed using the bounding box of that encloses the city.   The bounding box is tangent to the lowest and highest latitude and the westernmost and easternmost longitude of the city boundary.
+A primary key `id_grid` is also added.   When the grid cell is interior to the city boundary, its shape is a square.  But a grid cell which intersects the city boundary may have disconnected components and may therefore be a `MULTIPOLYGON`.
+
+```{r eval=runBigCalculations}
+
+# Make the grid where cells overlap some part of Raleigh with buffer
+
+grid_squares_raleigh_buffer = a1buffer %>% 
+  st_cast("MULTIPOLYGON") %>% 
+  st_sf() %>% 
+  rowid_to_column("id_grid") %>%
+    mutate( cols = rep(1:nColsBuff, nRowsBuff ) ,
+          rows = unlist( lapply(1:nRowsBuff, rep, nColsBuff) ) ) %>%
+  dplyr::filter(id_grid %in% unlist( st_intersects(gj_raleigh_buffer, .)))
+```
+
+The `st_intersection` operation can take a really long time. Let's check how many cells we get in the grid.
+
+```{r grid-intersection, eval=runBigCalculations, message = FALSE, warning=FALSE, error = FALSE}
+
+# This operation could take a really long time.
+grid_raleigh_buffer = grid_squares_raleigh_buffer %>% st_intersection(gj_raleigh_buffer)  # Same number of grid cells
+
+nrow(grid_raleigh_buffer)
+
+# Note that sf guesses the format of the output file from the suffix.
+
+st_write(grid_raleigh_buffer ,  dsn = grid_buffer_file , delete_dsn = TRUE, quiet = TRUE)
+
+```
+
+
+
+```{r load-city-buffered-grid, echo = FALSE}
+# Now we load the grid from file.
+
+grid_raleigh_buffer = sf::st_read(grid_buffer_file, quiet = TRUE ) %>% st_transform(2264)
+
+# Let's check it loading properly
+
+dim(grid_raleigh_buffer)
+
+```
+
+
+Now we export images of the grid overlay.
+
+```{r  message= FALSE, warning= FALSE}
+a1buffer %>% ggplot() + geom_sf( color = "green") +
+  geom_sf(data=gj_raleigh_buffer, fill="skyblue", alpha = 0.5 ) +
+  annotation_map_tile(type="osm", progress = "none", alpha = 0.5 ) +
+  labs(title = "Bounding Box of City with Buffer",  subtitle = paste0("Grid Resolution ", grid_cellsize, " ft")) -> p1
+
+grid_raleigh_buffer %>% ggplot() + geom_sf( color = "red") +
+  geom_sf(data=gj_raleigh_buffer, fill="yellow", alpha = 0.5 ) +
+  annotation_map_tile(type="osm", progress = "none", alpha = 0.5 ) +
+  labs(title = "City Grid with Buffer", subtitle = paste0("Grid Resolution ", grid_cellsize, " ft") ) -> p2
+
+
+( grid_plot = plot_grid(p1, p2) )
+
+grid_plot_file = paste0(data_dir, "EXP_RALEIGH_PLOT_GRID_", grid_cellsize, ".png" )
+
+cowplot::save_plot( grid_plot_file, grid_plot, base_height = 6 )
+
+```
+
+
+# Tabulating Points Data on a Grid
+
+We load the city grid from file since this is a costly operation that needs to be done only once.
+The general approach for a given category of point data is to tabulate the count of points falling inside a grid cell.
+The counts are arranged as a predictor column in a data table where each row corresponds to a grid cell.
+For example, potholes are geocoded as point data.   The number of potholes $N_{i}$ within grid cell $C_i$ will be assigned to the dataframe $DF$ such that
+$$DF[ i , POTHOLES ] = N_{i}$$
+
+
+
+## Points of Interest
+
+Points of interest data comes from the OpenStreetMap (OSM) project.  Files were downloaded from geofabrik.de , which maintains downloadable POI data for all global locations.   Some POI data is encoded as points and others as areas (polygons).   We download the North Carolina POI data files and subset the portion within the Raleigh City buffered boundaries.
+
+```{r load-pois}
+
+pois_raleigh_file = paste0(data_dir, "EXP_POIS_RALEIGH.geojson")
+pois_a_raleigh_file = paste0(data_dir, "EXP_POIS_A_RALEIGH.geojson")
+
+pois_raleigh = sf::st_read(pois_raleigh_file, quiet = TRUE ) %>% st_transform(2264)
+pois_a_raleigh = sf::st_read(pois_a_raleigh_file, quiet = TRUE ) %>% st_transform(2264)
+
+```
+
+```{r}
+
+pois_raleigh %>% group_by(fclass) %>% 
+  summarize( count = n() ) %>% 
+  st_drop_geometry() %>% 
+  arrange( desc( count )) -> pois_rank
+
+pois_a_raleigh %>% group_by(fclass) %>% 
+  summarize( count = n() ) %>% 
+  st_drop_geometry() %>% 
+  arrange( desc( count )) -> pois_a_rank
+
+```
+
+```{r eval=FALSE}
+
+pois_rank %>% kable(caption = "POIS RANK") %>% kable_styling(bootstrap_options = c("hover", "striped"))
+
+
+pois_a_rank %>% kable(caption = "POIS A RANK") %>% kable_styling(bootstrap_options = c("hover", "striped"))
+
+```
+
+The types of points of interest to be used in the analysis are below.  Note that the same type of Point of Interest may be mapped as both a point or an area representation by OSM.   Both data sets are merged into a consolidated point count.  To compute a point count for an area object, we identify all intersecting grid cells that overlap with the area object and count it once per cell.
+
+```{r}
+
+area_fclass = c("park", "swimming_pool", "playground", "hotel", "fast_food", "school", "restaurant", "bank", "track", "car_wash" , "sports_centre", "car_dealership", "supermarket", "golf_course" , 
+                "museum", "department_store", "university", "dentist", "pharmacy", "cafe" , "motel", "beauty_shop" , "bar" , "theatre", "cinema", "post_office" , "hospital", "nightclub", "courthouse" ,"prison" , 
+                "theme_park", "stadium" )
+
+point_fclass = c("restaurant", "fast_food", "supermarket", "bank", "cafe", "hairdresser", "beauty_shop", "school", "bar" , "pub", "convenience" , "car_dealership", "department_store" , "pharmacy" ,  "stadium" , 
+                 "hotel", "gift_shop", "university", "motel", "playground", "bakery" , "nightclub", "theatre", "cinema" )
+
+
+
+pois_raleigh %>% filter( fclass %in% point_fclass) -> pois_to_use
+
+pois_a_raleigh %>% filter( fclass %in% area_fclass) -> pois_a_to_use
+
+```
+
+
+Let's join the Points of interest data with our grid cell.  Note that some cells may contain no POI points or area.  These cells will be assigned zero counts.  The resulting POI dataset will have the same number of rows as cells in the City grid map.
+
+
+```{r count-pois-in-grid, error=FALSE, message= FALSE, warning = FALSE}
+#There are a small number of POIs outside of the buffered city limits.  
+# We'll drop these incidents and count only those in city limits.
+# This ensures both the id_grid and number of assaults are defined.
+# --------------------------------------------------------------------------- 
+gj_pois2grid <- pois_to_use %>% st_join(grid_raleigh_buffer) %>% filter( !is.na( id_grid  ))
+
+
+
+gj_pois_a2grid <- pois_a_to_use %>% st_join( grid_raleigh_buffer) %>% filter( !is.na(id_grid)) %>% st_drop_geometry() 
+
+gj_pois2grid %>% 
+  group_by( fclass, id_grid) %>% 
+  summarize( count= n()) %>%
+  st_drop_geometry() %>% ungroup() %>% mutate(  source = "point") -> counts_pois_thin
+
+gj_pois_a2grid %>%
+  group_by( fclass, id_grid) %>% 
+  summarize( count=n()) %>% 
+  ungroup() %>% mutate( source = "area" )  -> counts_pois_a_thin
+
+counts_pois_joint_thin = rbind( counts_pois_thin, counts_pois_a_thin)
+
+counts_pois_joint_thin %>% 
+  group_by(id_grid, fclass) %>%
+  summarize( count2 = sum(count)) %>%
+  ungroup() %>%
+  pivot_wider( names_from = fclass, values_from = count2, values_fill = 0 ) -> pois_joint_counts_on_grid
+
+# But we'll want to include id_grid with zero POIS counts.
+# ---------------------------------------------------------------
+grid_raleigh_buffer %>% 
+  st_drop_geometry() %>%
+  select(id_grid ) %>%
+  left_join( pois_joint_counts_on_grid , by = "id_grid") %>%
+  mutate_all( ~replace(., is.na(.), 0 ) ) %>% 
+  mutate( id_grid = as.integer( id_grid) ) %>% as_tibble() -> pois_joint_counts_on_grid
+
+head(pois_joint_counts_on_grid[,1:8]) %>% kable() %>% kable_styling(bootstrap_options = c("hover", "striped"))
+
+```
+
+## Potholes
+
+Now we tabulate the potholes data with our grid cell.   This historical dataset is provided by the City of Raleigh and represents work orders
+for pothole repairs.  Each observation may relate to multiple physical potholes but is time-stamped with a project initiation date.
+We only include potholes initiated during the training period to avoid look ahead bias on this dataset so they are limited to pothole orders in 2018.
+
+```{r count-potholes-in-grid}
+
+# We exclude potholdes initiated after 2018 to avoid look-ahead bias
+# ------------------------------------------------------------------
+gj_potholes %>% filter( year(as_date(initiate_date)) <= 2018 ) %>% filter( !st_is_empty(.)) -> gj_potholes_historic
+
+#There are a small number of assaults outside of the buffered city limits.  
+# We'll drop these incidents and count only those in city limits.
+# This ensures both the id_grid and number of assaults are defined.
+# --------------------------------------------------------------------------- 
+
+gj_potholes2grid <- gj_potholes_historic %>% st_join(grid_raleigh_buffer) %>% filter( !is.na( id_grid  ))
+
+# tibble of id_grid and num_potholes  ONLY FOR CELLS WHERE assaults were found.
+# --------------------------------------------------------------------------------
+pothole_counts_on_grid = gj_potholes2grid %>% group_by(id_grid) %>% summarize(num_potholes = n()) %>% st_drop_geometry()
+
+# But we'll want to include id_grid with zero assault counts.
+# ---------------------------------------------------------------
+grid_raleigh_buffer %>% 
+  st_drop_geometry() %>%
+  select(id_grid ) %>%
+  left_join( pothole_counts_on_grid, by = "id_grid") %>%
+  mutate_all( ~replace(., is.na(.), 0 ) ) -> pothole_counts_on_grid
+
+```
+
+# Census Demographic Data
+
+
+
+## Unemployment Data
+
+Load the unemployment data.
+
+```{r}
+
+unemp_root = "acs2019_5yr_B23025_15000US371830529022"
+
+unemp_B23025_raw = st_read( paste0(data_dir, unemp_root, "/", unemp_root, ".geojson" )
+                                     , quiet = TRUE ) %>% st_transform(2264)
+```
+
+Extract the regional average unemployment rate for imputation of regions with undefined unemployment rates.
+
+```{r}
+regional_avg_unemp_rate  = unemp_B23025_raw %>% 
+  filter( geoid == "31000US39580") %>% 
+  mutate( rate = B23025005 / B23025001)  %>% 
+  pull( rate )
+
+```
+
+Impute any missing poverty rate regions with the median rate for the entire Raleigh-Cary Metro Area.
+
+```{r}
+
+unemp_B23025_raw %>% 
+  select( geoid, name, B23025005, B23025001 ) %>% 
+  filter( name  != 'Raleigh-Cary, NC Metro Area')  %>% 
+  mutate( unemployment_rate = ifelse( B23025001  == 0, regional_avg_unemp_rate , B23025005 / B23025001) )  %>% 
+  mutate( area = st_area(.)) -> gj_unemp
+
+```
+
+We use spatial area-weighted interpolation to get the average unemployment rate of each cell. The result is an `sf` dataframe of the same row count and row order as `grid_raleigh_buffer`. No join is required to map `id_grid` to the weighted average unemployment rate.
+
+```{r interpolate-unemployment}
+x = st_interpolate_aw( gj_unemp["unemployment_rate"], grid_raleigh_buffer, extensive = FALSE )
+
+unemployment_on_grid = tibble( id_grid = grid_raleigh_buffer$id_grid, unemployment_rate = x$unemployment_rate)
+```
+
+## Median Household Income
+
+Load the median household income data.
+
+```{r}
+
+
+income_root = "acs2019_5yr_B19013_15000US371830529022"   # Larger Income region
+
+
+income_B19013_raw = st_read( paste0(data_dir, income_root, "/", income_root, ".geojson" )
+                                     , quiet = TRUE ) %>% st_transform(2264)
+```
+
+Extract the regional average unemployment rate for imputation of regions with undefined unemployment rates.
+
+```{r}
+regional_avg_income  = 67266  # Median household income for Raleigh city in 2019 inflated adjusted dollars
+
+```
+
+Impute any missing median household income with the regional median household income for the entire Raleigh-Cary Metro Area.
+
+```{r}
+
+income_B19013_raw %>%  select( geoid, name, B19013001 ) %>% 
+ mutate( income = ifelse( is.na(B19013001) | B19013001  == 0, regional_avg_income , B19013001) )  %>% 
+ mutate( area = st_area(.)) -> gj_income
+
+```
+
+Spatial area weighted interpolation of household median income onto grid cells.
+
+```{r interpolate-income}
+x = st_interpolate_aw( gj_income["income"], grid_raleigh_buffer, extensive = FALSE )
+
+income_on_grid = tibble( id_grid = grid_raleigh_buffer$id_grid, income = x$income )
+```
+
+## Poverty Rate
+
+Load the poverty geojson census data.
+
+```{r}
+pov_root = "acs2019_5yr_B17017_15000US371830529022"
+
+poverty_B17017_raw = st_read( paste0(data_dir, pov_root, "/", pov_root, ".geojson" )
+                                     , quiet = TRUE ) %>% st_transform(2264)
+```
+
+Extract the regional average poverty rate.
+
+```{r}
+regional_avg_poverty_rate = poverty_B17017_raw %>% 
+  filter( geoid == "31000US39580") %>% 
+  mutate( rate = B17017002 / B17017001)  %>% 
+  pull(rate)
+
+```
+
+Impute any missing poverty rate regions with the median rate for the entire Raleigh-Cary Metro Area.
+
+```{r}
+
+poverty_B17017_raw %>% 
+  select( geoid, name, B17017001, B17017002 ) %>% 
+  filter( name  != 'Raleigh-Cary, NC Metro Area')  %>% 
+  mutate( poverty_rate = ifelse( B17017001 == 0, regional_avg_poverty_rate , B17017002 / B17017001) )  %>% 
+  mutate( area = st_area(.)) -> gj_poverty
+
+```
+
+Spatial area weighted interpolation of poverty rate onto grid cells.
+
+```{r interpolate-poverty}
+x = st_interpolate_aw( gj_poverty["poverty_rate"], grid_raleigh_buffer, extensive = FALSE )
+
+poverty_on_grid = tibble( id_grid = grid_raleigh_buffer$id_grid, poverty_rate = x$poverty_rate )
+```
+
+## Population Density
+
+Population density data has no missing values, so no imputation code is used.
+
+```{r}
+
+pop_root = "acs2019_5yr_B01003_15000US371830529022"   # Larger Population region
+
+
+pop_B01003_raw = st_read( paste0(data_dir, pop_root, "/", pop_root, ".geojson" )
+                                     , quiet = TRUE ) %>% st_transform(2264)
+```
+
+There are no missing values in the Total Population table for any block group or region, so we will be able to define a population density as total population per square mile.
+
+```{r}
+
+pop_B01003_raw %>%  select( geoid, name, B01003001 ) %>% 
+ mutate( population = ifelse( is.na(B01003001) , 0 , B01003001) )  %>% 
+ mutate( area = st_area(.)) %>% 
+ mutate( density = population / ( area / (5280^2 ) ) )    -> gj_pop
+
+```
+
+Spatial area weighted interpolation of population density on grid cells.
+
+```{r interpolate-density}
+x = st_interpolate_aw( gj_pop["density"], grid_raleigh_buffer, extensive = FALSE )
+
+density_on_grid = tibble( id_grid = grid_raleigh_buffer$id_grid, density = as.numeric(x$density ) )
+```
+
+
+#  Merging all non-crime predictors within Grid
+
+A key goal of this script is now ready to be handled.   We wish to export the non-crime input data for model building, so
+we'll combine all non-crime data into one big grid whose rows equal the number of grid cells in the Raleigh buffered map.
+All grid count sets should have been normalized to have zero counts for cells with no point data.
+
+
+Our first step is to enrich the grid with geographic data: longitude, latitude of each cell's centroid and the area of each cell in square feet.
+
+
+```{r join-pois-to-grid}
+
+coords = st_coordinates( st_centroid(grid_raleigh_buffer) %>% st_transform(4326) )  %>% as_tibble()
+
+
+all_noncrime_on_grid = grid_raleigh_buffer %>% 
+  left_join( pothole_counts_on_grid, by = "id_grid" ) %>%
+  left_join( pois_joint_counts_on_grid, by = "id_grid") 
+
+# Add the longitude, latitude and area in square feet of each grid cell
+all_noncrime_on_grid$lon = coords$X
+all_noncrime_on_grid$lat = coords$Y
+
+# Add the area in square feet
+all_noncrime_on_grid$area = as.numeric( st_area( grid_raleigh_buffer))
+
+dim(all_noncrime_on_grid)
+
+# Check that we didn't drop all values in doing left_join
+# Should return TRUE
+(nrow(grid_raleigh_buffer) == nrow(all_noncrime_on_grid) )
+
+# None of the cells should be NA.  Should return TRUE
+any(is.na(all_noncrime_on_grid)) == FALSE
+```
+
+
+Next, we add the census demographic data as well.
+
+```{r join-demographic-predictors-to-grid}
+
+all_noncrime_on_grid = all_noncrime_on_grid %>% 
+  left_join( unemployment_on_grid, by = "id_grid" ) %>%
+  left_join( income_on_grid, by = "id_grid") %>%
+  left_join( poverty_on_grid, by = "id_grid") %>%
+  left_join( density_on_grid, by = "id_grid" )
+
+dim(all_noncrime_on_grid)
+
+# Check that we didn't drop all values in doing left_join
+# Should return TRUE.  
+(nrow(grid_raleigh_buffer) == nrow(all_noncrime_on_grid) )
+
+# None of the cells should be NA.  Should return TRUE
+any(is.na(all_noncrime_on_grid)) == FALSE
+
+```
+
+Lastly, we inspect the non-crime final dataset before exporting the contents as a geojson file.  
+The dataframe is transposed for ease of use and the geometry column is dropped for brevity.
+
+```{r}
+
+dim(all_noncrime_on_grid)
+head(all_noncrime_on_grid, n = 3) %>% st_drop_geometry() %>% t() %>%
+  kable( digit = 2) %>% kable_styling(bootstrap_options = c("hover", "striped"))
+
+```
+
+
+```{r}
+all_noncrime_on_grid %>% 
+  ggplot() +  
+  annotation_map_tile(type="osm", progress = "none", alpha = 0.7 ) +
+  geom_sf( aes(fill = num_potholes ) , alpha = 0.7, lwd = 0 ) +
+  scale_fill_viridis_c(option="C") +
+  labs(title = paste0("Potholes on Grid"), subtitle = paste0("Resolution ", grid_cellsize ," feet" ) ) -> p_potholes
+
+potholes_plot_file = paste0(data_dir, "EXP_POTHOLES_PLOT_GRID_", grid_cellsize, ".png" )
+
+cowplot::save_plot( potholes_plot_file, p_potholes , base_height = 6 )
+
+p_potholes
+
+```
+
+
+```{r}
+all_noncrime_on_grid %>% 
+  ggplot() +  
+  annotation_map_tile(type="osm", progress = "none", alpha = 0.7 ) +
+  geom_sf( aes(fill = income ) , alpha = 0.7, lwd = 0 ) +
+  scale_fill_viridis_c(option="C") +
+  theme(axis.ticks.x = element_blank()) +
+  labs(title = paste0("Median Household Income on Grid"), subtitle = paste0("Resolution ", grid_cellsize ," feet" ) ) -> p_income
+
+income_plot_file = paste0(data_dir, "EXP_INCOME_PLOT_GRID_", grid_cellsize, ".png" )
+
+cowplot::save_plot( income_plot_file, p_income , base_height = 6 )
+
+p_income
+
+```
+
+
+```{r}
+all_noncrime_on_grid %>% 
+  ggplot() +  
+  annotation_map_tile(type="osm", progress = "none", alpha = 0.7 ) +
+  geom_sf( aes(fill = density ) , alpha = 0.7, lwd = 0) +
+  scale_fill_viridis_c(option="C") +
+  labs(title = paste0("Population Density on Grid"), subtitle = paste0("Resolution ", grid_cellsize ," feet" ) ) -> p_density
+
+density_plot_file = paste0(data_dir, "EXP_DENSITY_PLOT_GRID_", grid_cellsize, ".png" )
+
+cowplot::save_plot( density_plot_file, p_income , base_height = 6 )
+
+p_density
+
+```
+
+
+```{r}
+all_noncrime_on_grid %>% 
+  ggplot() +  
+  annotation_map_tile(type="osm", progress = "none", alpha = 0.7 ) +
+  geom_sf( aes(fill = poverty_rate) , alpha = 0.7, lwd = 0 ) +
+  scale_fill_viridis_c(option="C") +
+  labs(title = paste0("Poverty Rate on Grid"), subtitle = paste0("Resolution ", grid_cellsize ," feet" ) ) -> p_poverty
+
+poverty_plot_file = paste0(data_dir, "EXP_POVERTY_PLOT_GRID_", grid_cellsize, ".png" )
+
+cowplot::save_plot( poverty_plot_file, p_poverty , base_height = 6 )
+
+p_poverty
+
+```
+
+
+
+```{r save-demographics-panel-plots}
+all_noncrime_on_grid %>% 
+  ggplot() +  
+  annotation_map_tile(type="osm", progress = "none", alpha = 0.7 ) +
+  geom_sf( aes(fill = unemployment_rate ) , alpha = 0.7, lwd = 0 ) +  # no boundaries
+  scale_fill_viridis_c(option="C") +
+  labs(title = paste0("Unemployment Rate on Grid"), subtitle = paste0("Resolution ", grid_cellsize ," feet" ) ) -> p_unemployment
+
+unemployment_plot_file = paste0(data_dir, "EXP_UNEMPLOYMENT_PLOT_GRID_", grid_cellsize, ".png" )
+
+cowplot::save_plot( unemployment_plot_file, p_poverty , base_height = 6 )
+
+p_unemployment
+
+```
+
+
+
+```{r}
+all_noncrime_on_grid %>% 
+  ggplot() +  
+  annotation_map_tile(type="osm", progress = "none", alpha = 0.7 ) +
+  geom_sf( aes(fill = bar ) , alpha = 0.7, lwd = 0 ) +  # no boundaries
+  scale_fill_viridis_c(option="C") +
+  labs(title = paste0("Bars on Grid"), subtitle = paste0("Resolution ", grid_cellsize ," feet" ) ) -> p_bars
+
+bars_plot_file = paste0(data_dir, "EXP_BARS_PLOT_GRID_", grid_cellsize, ".png" )
+
+cowplot::save_plot( bars_plot_file, p_bars , base_height = 6 )
+
+p_bars
+
+```
+
+
+```{r}
+all_noncrime_on_grid %>% 
+  ggplot() +  
+  annotation_map_tile(type="osm", progress = "none", alpha = 0.7 ) +
+  geom_sf( aes(fill = restaurant ) , alpha = 0.7, lwd = 0 ) +  # no boundaries
+  scale_fill_viridis_c(option="C") +
+  labs(title = paste0("Restaurants on Grid"), subtitle = paste0("Resolution ", grid_cellsize ," feet" ) ) -> p_restaurants
+
+restaurants_plot_file = paste0(data_dir, "EXP_RESTAURANTS_PLOT_GRID_", grid_cellsize, ".png" )
+
+cowplot::save_plot( restaurants_plot_file, p_restaurants , base_height = 6 )
+
+p_restaurants
+
+```
+
+```{r}
+
+demographics_plot_file = paste0(data_dir, "EXP_DEMOGRAPHICS_PLOT_GRID_", grid_cellsize, ".png" )
+
+p_demographics = cowplot::plot_grid(p_income, p_unemployment, p_poverty, p_density  )
+
+cowplot::save_plot( demographics_plot_file, p_demographics , base_height = 6 )
+
+
+```
+
+
+```{r eval=TRUE, message = FALSE, error = FALSE}
+
+# Note that sf guesses the format of the output file from the suffix.
+all_noncrime_on_grid_file =  paste0(data_dir, "EXP_ALL_NONCRIME_ON_GRID_", grid_cellsize ,".geojson")
+
+st_write(all_noncrime_on_grid ,  dsn = all_noncrime_on_grid_file , delete_dsn = TRUE, quiet= TRUE)
+
+```
+
+
+
+
+
+# Generating Crime Frequency Data within Grid
+
+
+We observe that only `crime` *st_join* `grid` seems to preserve the same number of `crime` elements. When we join `grid` to `crime` we get extra rows corresponding to cells where no crime is present.
+
+
+```{r map-crimes-to-grid}
+#There are a small number of assaults outside of the buffered city limits.  
+# We'll drop these incidents and count only those in city limits.
+# This ensures both the id_grid and number of assaults (crime_count) are defined.
+# --------------------------------------------------------------------------- 
+gj_assault2grid <- gj_assault_geocoded %>% st_join(grid_raleigh_buffer) %>% filter( !is.na( id_grid  ))
+
+# tibble of id_grid and crime_count ONLY FOR CELLS WHERE assaults were found.
+# --------------------------------------------------------------------------------
+crime_counts_on_grid = gj_assault2grid %>% group_by(id_grid) %>% summarize(crime_count = n()) %>% st_drop_geometry()
+
+# But we'll want to include id_grid with zero crime counts.
+# ---------------------------------------------------------------
+grid_raleigh_buffer %>% 
+  st_drop_geometry() %>%
+  select(id_grid ) %>%
+  left_join( crime_counts_on_grid, by = "id_grid") %>%
+  mutate_all( ~replace(., is.na(.), 0 ) ) -> crime_counts_on_grid
+
+```
+
+## Generate Period Crime Frequency Data with Grid
+
+```{r set-dates}
+library(lubridate)
+
+base_date = ymd("2019-12-31")
+
+forward_date  = base_date + years(1)
+base_minus_6M = base_date %m-% months(6)
+base_minus_1Y = base_date %m-% years( 1)
+base_minus_2Y = base_date %m-% years( 2)
+base_minus_3Y = base_date %m-% years( 3)
+
+print(paste0( "Base date is: ", base_date  ))
+print(paste0( "Test Period is: ", base_date , " < x <= ", forward_date ) )
+print(paste0( "Training Period 6M-base ", base_minus_6M , " < x <= ", base_date ) )
+print(paste0( "Training Period 1Y-6M ", base_minus_1Y , " < x <= ", base_minus_6M ) )
+print(paste0( "Training Period 2Y-1Y ", base_minus_2Y , " < x <= ", base_minus_1Y ) )
+print(paste0( "Training Period 3Y-2Y ", base_minus_3Y , " < x <= ", base_minus_2Y ) )
+
+
+```
+
+
+```{r}
+
+crime_counts_in_period <- function( dt_start , dt_end , grid,  gj_crime  ){
+  
+    crime_counts <- gj_crime %>% 
+    filter( dt_start < reported_date & reported_date <= dt_end ) %>%
+    st_join(grid) %>% 
+    filter( !is.na( id_grid  )) %>%
+    group_by(id_grid) %>% 
+    summarize(crime_count = n()) %>% 
+      st_drop_geometry()
+    
+    grid %>% 
+      st_drop_geometry() %>%
+      select(id_grid ) %>%
+      left_join( crime_counts, by = "id_grid") %>%
+      mutate_all( ~replace(., is.na(.), 0 ) ) %>%
+      as_tibble() -> crime_counts_on_grid
+
+    return(crime_counts_on_grid)
+}
+```
+
+
+
+```{r count-crimes-in-period}
+
+
+
+
+make_crime_count_grid <- function(base_date){
+
+  forward_date  = base_date + years(1)
+  base_minus_6M = base_date %m-% months(6)
+  base_minus_1Y = base_date %m-% years( 1)
+  base_minus_2Y = base_date %m-% years( 2)
+  base_minus_3Y = base_date %m-% years( 3)
+
+  print(paste0( "Base date is: ", base_date  ))
+  print(paste0( "Test Period is: ", base_date , " < x <= ", forward_date ) )
+  print(paste0( "Training Period 6M-base ", base_minus_6M , " < x <= ", base_date ) )
+  print(paste0( "Training Period 1Y-6M ", base_minus_1Y , " < x <= ", base_minus_6M ) )
+  print(paste0( "Training Period 2Y-1Y ", base_minus_2Y , " < x <= ", base_minus_1Y ) )
+  print(paste0( "Training Period 3Y-2Y ", base_minus_3Y , " < x <= ", base_minus_2Y ) )
+
+  # The test crime frequency
+  cc_base_to_forward_grid = crime_counts_in_period( base_date, forward_date ,    grid_raleigh_buffer, gj_assault_geocoded ) %>% 
+    mutate( crime_freq = crime_count )
+
+  # the past 6 month predictor (frequency is annualized)
+  cc_6M_to_base_grid = crime_counts_in_period( base_minus_6M, base_date ,    grid_raleigh_buffer, gj_assault_geocoded ) %>% 
+    rename( crime_count_6M = crime_count ) %>% 
+    mutate( crime_freq_6M = 2 * crime_count_6M) 
+
+  # the past 12m-6m predictor (frequency is annualized)
+  cc_1Y_to_6M_grid   = crime_counts_in_period( base_minus_1Y, base_minus_6M, grid_raleigh_buffer, gj_assault_geocoded ) %>%
+    rename( crime_count_1Y = crime_count ) %>% 
+    mutate( crime_freq_1Y = 2 * crime_count_1Y) 
+
+  # the past 2Y-1Y predictor
+  cc_2Y_to_1Y_grid   = crime_counts_in_period( base_minus_2Y, base_minus_1Y, grid_raleigh_buffer, gj_assault_geocoded ) %>%
+      rename( crime_count_2Y = crime_count ) %>% 
+      mutate( crime_freq_2Y =  crime_count_2Y)
+
+  # the past 3Y-2Y predictor
+  cc_3Y_to_2Y_grid   = crime_counts_in_period( base_minus_3Y, base_minus_2Y, grid_raleigh_buffer, gj_assault_geocoded ) %>%
+      rename( crime_count_3Y = crime_count ) %>% 
+      mutate( crime_freq_3Y =  crime_count_3Y)
+
+  # Join the crime frequencies and counts
+  cc_data_grid = cc_base_to_forward_grid %>% 
+    left_join(cc_6M_to_base_grid, by = "id_grid") %>%
+    left_join(cc_1Y_to_6M_grid, by = "id_grid") %>%
+    left_join(cc_2Y_to_1Y_grid, by = "id_grid") %>%
+    left_join(cc_3Y_to_2Y_grid, by = "id_grid")
+
+  dim(cc_data_grid)
+  head(cc_data_grid, n = 3)
+  
+  return(cc_data_grid)
+}
+
+
+```
+
+
+```{r save-crime-counts-to-file}
+
+#base_date = ymd("2019-12-31")
+
+#train_crime_grid = make_crime_count_grid(base_date)
+
+#train_crime_counts_on_grid_file = paste0(data_dir, "EXP_CRIME_FREQ_GRID_TRAIN_", grid_cellsize, ".csv")
+
+#train_crime_grid %>% utils::write.csv( train_crime_counts_on_grid_file , row.names = FALSE, quote = FALSE )
+
+make_all_data_grid_files <- function( base_date, grid_cellsize, crime_csv_root , noncrime_on_grid,  all_data_gj_root,  data_dir )
+{
+    crime_grid = make_crime_count_grid(base_date)
+    all_data_on_grid = noncrime_on_grid %>% left_join(crime_grid, by = "id_grid")
+  
+    crime_csv_file = paste0(data_dir, crime_csv_root, "_", grid_cellsize, "_", base_date, ".csv")
+    all_data_gj_file = paste0( data_dir, all_data_gj_root, "_", grid_cellsize, "_", base_date, ".geojson")
+    
+    crime_grid %>% utils::write.csv( crime_csv_file , row.names = FALSE, quote = FALSE )
+    st_write(all_data_on_grid ,  dsn = all_data_gj_file , delete_dsn = TRUE, quiet= TRUE)
+
+    print(paste0("Wrote: ", crime_csv_file))
+    print( paste0("Wrote: ", all_data_gj_file ))
+    
+    return(all_data_on_grid)
+}
+
+```
+
+
+
+```{r make_train_2017_dataset}
+
+all_data_on_grid = make_all_data_grid_files( base_date = ymd("2017-12-31"),
+                                             grid_cellsize = grid_cellsize ,
+                                             "EXP_CRIME_FREQ_GRID",
+                                             all_noncrime_on_grid ,
+                                             "EXP_ALL_DATA_ON_GRID" ,
+                                             data_dir
+                                             )
+
+
+```
+
+```{r make_train_dataset}
+
+all_data_on_grid = make_all_data_grid_files( base_date = ymd("2018-12-31"),
+                                             grid_cellsize = grid_cellsize ,
+                                             "EXP_CRIME_FREQ_GRID",
+                                             all_noncrime_on_grid ,
+                                             "EXP_ALL_DATA_ON_GRID" ,
+                                             data_dir
+                                             )
+
+
+```
+
+The following file export contains both the non-crime and crime predictors as well as the response variable.
+We run basic validation checks which should all be TRUE.
+
+```{r save-all-data-on-grid, eval=TRUE, message = FALSE, error = FALSE}
+
+dim(all_data_on_grid)
+
+# Check that we didn't drop all values in doing left_join
+# Should return TRUE.  
+(nrow(grid_raleigh_buffer) == nrow(all_data_on_grid) )
+
+# None of the cells should be NA.  Should return TRUE
+any(is.na(all_data_on_grid)) == FALSE
+
+
+```
+
+
+```{r make_test_dataset}
+
+all_data_on_grid = make_all_data_grid_files( base_date = ymd("2019-12-31"),
+                                             grid_cellsize = grid_cellsize ,
+                                             "EXP_CRIME_FREQ_GRID",
+                                             all_noncrime_on_grid ,
+                                             "EXP_ALL_DATA_ON_GRID" ,
+                                             data_dir
+                                             )
+
+
+```
+
+
+
+
+
+Finally, let's plot the crime density on the grid.
+
+```{r}
+all_data_on_grid %>% 
+  ggplot() +  
+  annotation_map_tile(type="osm", progress = "none", alpha = 0.7 ) +
+  geom_sf( aes(fill = crime_freq ) , alpha = 0.7, lwd = 0 ) +  # no boundaries
+  scale_fill_viridis_c(option="C") +
+  labs(title = paste0("Assault Rate in Test Period"), subtitle = paste0("Resolution ", grid_cellsize ," feet" ) ) -> p_crime_freq
+
+crime_freq_plot_file = paste0(data_dir, "EXP_CRIME_FREQ_PLOT_GRID_", grid_cellsize, ".png" )
+
+cowplot::save_plot( crime_freq_plot_file, p_crime_freq , base_height = 6 )
+
+
+```
+
+
+```{r}
+all_data_on_grid %>% 
+  ggplot() +  
+  annotation_map_tile(type="osm", progress = "none", alpha = 0.7 ) +
+  geom_sf( aes(fill = crime_freq_6M ) , alpha = 0.7, lwd = 0 ) +  # no boundaries
+  scale_fill_viridis_c(option="C") +
+  labs(title = paste0("Assault Rate in 6M Prior Period"), subtitle = paste0("Resolution ", grid_cellsize ," feet" ) ) -> p_crime_freq_6M
+
+crime_freq_6M_plot_file = paste0(data_dir, "EXP_CRIME_FREQ_6M_PLOT_GRID_", grid_cellsize, ".png" )
+
+cowplot::save_plot( crime_freq_6M_plot_file, p_crime_freq_6M , base_height = 6 )
+
+
+```
+
+
+
+
+```{r}
+all_data_on_grid %>% 
+  ggplot() +  
+  annotation_map_tile(type="osm", progress = "none", alpha = 0.7 ) +
+  geom_sf( aes(fill = crime_freq_1Y ) , alpha = 0.7, lwd = 0 ) +  # no boundaries
+  scale_fill_viridis_c(option="C") +
+  labs(title = paste0("Assault Rate in 1Y-6M Prior Period"), subtitle = paste0("Resolution ", grid_cellsize ," feet" ) ) -> p_crime_freq_1Y
+
+crime_freq_1Y_plot_file = paste0(data_dir, "EXP_CRIME_FREQ_1Y_PLOT_GRID_", grid_cellsize, ".png" )
+
+cowplot::save_plot( crime_freq_1Y_plot_file, p_crime_freq_1Y , base_height = 6 )
+
+```
+
+
+
+```{r}
+all_data_on_grid %>% 
+  ggplot() +  
+  annotation_map_tile(type="osm", progress = "none", alpha = 0.7 ) +
+  geom_sf( aes(fill = crime_freq_2Y ) , alpha = 0.7, lwd = 0 ) +  # no boundaries
+  scale_fill_viridis_c(option="C") +
+  labs(title = paste0("Assault Rate in 2Y Prior Period"), subtitle = paste0("Resolution ", grid_cellsize ," feet" ) ) -> p_crime_freq_2Y
+
+crime_freq_2Y_plot_file = paste0(data_dir, "EXP_CRIME_FREQ_2Y_PLOT_GRID_", grid_cellsize, ".png" )
+
+cowplot::save_plot( crime_freq_2Y_plot_file, p_crime_freq_2Y , base_height = 6 )
+
+
+```
+
+```{r save-crimes-panel}
+
+crimes_panel_plot_file = paste0(data_dir, "EXP_CRIMES_PANEL_PLOT_GRID_", grid_cellsize, ".png" )
+
+p_crimes_panel = cowplot::plot_grid(p_crime_freq_2Y, p_crime_freq_1Y, p_crime_freq_6M, p_crime_freq  )
+
+cowplot::save_plot( crimes_panel_plot_file, p_crimes_panel , base_height = 6 )
+
+p_crimes_panel
+```

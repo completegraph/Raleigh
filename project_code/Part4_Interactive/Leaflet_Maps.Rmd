@@ -1,0 +1,754 @@
+---
+title: "Map of Raleigh NC Assaults"
+author: "Alexander Ng"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output:
+  html_document:
+    df_print: paged
+    highlight: tango
+    number_sections: yes
+    theme: readable
+    toc: yes
+    toc_depth: 2
+    toc_float: no
+    fontsize: 12
+  pdf_document:
+    toc: yes
+    toc_depth: '2'
+subtitle: Production
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+```{r message=FALSE, warning=FALSE}
+suppressPackageStartupMessages(library(knitr) )
+suppressPackageStartupMessages( library(tidyverse) )
+suppressPackageStartupMessages(library(kableExtra) )
+
+suppressPackageStartupMessages(library(sf))
+suppressPackageStartupMessages(library(caret))
+
+library(ggspatial)
+library(cowplot)
+library(Cubist)
+library(ranger)
+library(cowplot)
+library(skimr)
+library(viridis)
+library(RColorBrewer)
+library(leaflet)
+library(htmltools)
+library(htmlwidgets)
+library(lubridate)
+```
+
+# {.tabset .tabset-fade}
+
+## TAB 1
+
+# Introduction
+
+The objective of this analysis is to build interactive visualizations of predicted crime hotspots, actual crime behaviour and the predictors in Raleigh, North Carolina.
+Due to the large volume of data, we divide the analyses into two maps.  One map depicts the hotspots together with demographic predictors.   The second map depicts the hotspots
+together with points of interest predictors and all predicted crime in the city.
+
+
+# Configuration and File Import
+
+The model output was pre-generated.
+We will load the Models for the 2020 test period.   Base date is 2019-12-31.
+
+
+```{r configuration, echo = FALSE}
+
+proj_dir = "/Volumes/GDRIVE_SSD/homes/alex/datascience/698_CAPSTONE_2021_FALL"
+working_dir = paste0(proj_dir, "/", "project_code/Part4_Interactive/")
+data_dir = paste0(proj_dir, "/project_data/")
+
+setwd(working_dir)
+```
+
+
+
+```{r define-model-result-files-2019}
+
+PAI_cubist_ranked_grid_20191231_file = paste0(data_dir, "EXP_CUBIST_PAI_RANKED_GRID_2019-12-31.geojson")
+
+PEI_cubist_csv_grid_20191231_file = paste(data_dir, "EXP_CUBIST_PEI_RANKED_CSV_2019-12-31.csv")
+
+PAI_rf_ranked_grid_20191231_file = paste0(data_dir, "EXP_RANDOMFOREST_PAI_RANKED_GRID_2019-12-31.geojson")
+
+PEI_rf_csv_grid_20191231_file = paste(data_dir, "EXP_RANDOMFOREST_PEI_RANKED_CSV_2019-12-31.csv")
+
+```
+
+```{r map-file-load}
+raleigh_corporate_limits_file = paste0(data_dir, "Corporate_Limits.geojson")
+
+```
+
+```{r load-raleigh-boundary}
+#
+# Load the geojson files
+# change the coordinate system to 2264
+# filter objects that belong to RALEIGHT
+# --------------------------------------------
+gj_raleigh <- sf::st_read(raleigh_corporate_limits_file, quiet = TRUE) %>% 
+  st_transform(2264) %>% 
+  filter( SHORT_NAME == 'RAL' )
+
+gj_raleigh_buffer = st_buffer(gj_raleigh, dist = 100 ) %>% st_union() %>% st_sf() 
+
+```
+
+```{r load-PAI-cubist-grid}
+
+PAI_cu_ranked_grid_20191231 <- sf::st_read( PAI_cubist_ranked_grid_20191231_file, quiet = TRUE ) %>%
+    st_transform(2264) 
+
+PAI_rf_ranked_grid_20191231 <- sf::st_read( PAI_rf_ranked_grid_20191231_file, quiet = TRUE ) %>%
+    st_transform(2264) 
+
+```
+
+```{r}
+
+# Diagnostic
+
+#PAI_rf_ranked_grid_20191231 %>% 
+#  st_drop_geometry() %>% 
+#  select( rank, id_grid, cum_crime_freq,  prop_cum_area, prop_cum_crime_freq , PAI , RRI ) %>% 
+#  left_join( PAI_cu_ranked_grid_20191231 %>% 
+#               st_drop_geometry() %>% 
+#               select( rank, id_grid, cum_crime_freq , prop_cum_area, prop_cum_crime_freq, PAI, RRI ), by = "rank") %>%
+#  rename( id_grid_rf              = id_grid.x, 
+#          cum_crime_freq_rf       = cum_crime_freq.x ,
+#          prop_cum_area_rf        = prop_cum_area.x,
+#          prop_cum_crime_freq_rf  = prop_cum_crime_freq.x ,
+#          PAI_rf                  = PAI.x ,
+#          RRI_rf                  = RRI.x ,
+#          id_grid_cu              = id_grid.y ,
+#          cum_crime_freq_cu       = cum_crime_freq.y ,
+#          prop_cum_area_cu        = prop_cum_area.y ,
+#          prop_cum_crime_freq_cu  = prop_cum_crime_freq.y ,
+#          PAI_cu                  = PAI.y ,
+#          RRI_cu                  = RRI.y
+#          ) -> PAI_comparison_20191231 
+
+```
+
+
+# Leaflet Hotspot and Demographics Map
+
+This section builds a map relating crime hotspots to demographics for each of the Random Forest and Cubist models.  
+
+
+```{r}
+# Make a leaflet title
+
+rr <- tags$div(HTML('<h3>Assault Hotspot Prediction</h3><br>2020 Forecasts<br>with Demographic Variables<br>Random Forest Model<br>Raleigh, NC<br>Alexander Ng' ) )
+
+
+
+rc <- tags$div(HTML('<h3>Assault Hotspot Prediction</h3><br>2020 Forecasts<br>with Demographic Variables<br>Cubist Model<br>Raleigh, NC<br>Alexander Ng' ) )
+
+```
+
+
+
+## Random Forest Map - Demographics
+
+```{r load-rf-grid-output}
+
+# Load the grid cells from random forest. Add HTML table as label when hovering.
+# ---------------------------------------------------------------------------------
+hotspot_cells_20191231 <- PAI_rf_ranked_grid_20191231 %>% 
+                                    filter( hotspot==1) %>% 
+                                    st_transform(4326) %>% 
+                                    mutate( Label = paste0( "<br><b>Hotspot :</b>",rank , "</b>", 
+                                                   "<br><b>","Assaults 2020 ", "</b>" ,
+                                                   "<table>" ,
+                                                   "<tr><td>", "Predicted:", "</td><td>"    , round(pred_crime_freq, 1) , "</td></tr>" ,
+                                                   "<tr><td>", "       2020:", "</td><td>"  , crime_freq , "</td></tr>" ,
+                                                   "<tr><td>", "       2019:", "</td><td>"  , round(0.5 * ( crime_freq_6M + crime_freq_1Y), 0) , "</td></tr>" ,
+                                                   "<tr><td>", "       2018:", "</td><td>"  , crime_freq_2Y , "</td></tr>" ,
+                                                   "<tr><td>", "       2017:", "</td><td>"  , crime_freq_3Y, "</td></tr>" ,
+                                                   "</table>"
+                                                            ))
+
+#
+# Save the crime grid.  Add HTML table for label when hovering over each cell.
+# ---------------------------------------------------------------------------------
+demographics_cells_20191231 <-  PAI_rf_ranked_grid_20191231 %>%  
+                                    st_transform(4326) %>%
+                                    mutate( poverty_pct = 100 * poverty_rate , 
+                                            unemployment_pct = 100 * unemployment_rate ,
+                                                Label = paste0( "<br><b>Demographics :</b>", 
+                                                   "<br>",
+                                                   "<table>" ,
+                                                   "<tr><td>", "Poverty Rate%:", "</td><td>"  , round(poverty_pct, 1), "</td></tr>" ,
+                                                   "<tr><td>", "      Income:", "</td><td>$"  , round(income,0) , "</td></tr>" ,
+                                                   "<tr><td>", "Unemployment%:", "</td><td>"  , round( unemployment_pct , 1) , "</td></tr>" ,
+                                                   "<tr><td>", "      Density #/sq mile:", "</td><td>"  , round(density,0) , "</td></tr>" ,
+                                                   "</table>"  )) 
+
+
+cell_palette <- colorBin("Spectral", hotspot_cells_20191231$rank , 5 )
+
+poverty_palette <- colorNumeric("Greens", demographics_cells_20191231$poverty_pct , 5 )
+
+density_palette <- colorNumeric("Oranges", demographics_cells_20191231$density , 5 )
+
+income_palette <- colorNumeric("RdYlBu", demographics_cells_20191231$income , 5 )
+
+
+
+```
+
+
+The Leaflet map below depicts Raleigh with multiple layers.  It focuses on show the Random Forest Hotspot predictions for the test period Jan 1, 2020 - Dec 31, 2020.   The observation date is Dec 31, 2019.
+The map compares the following datasets.   Note that all demographic variables are calculated in similar fashion: from the ACS 2019 survey at the Census Block Group level and spatially interpolated to each grid cell.
+
+*    `Hotspots Predicted`  Crime hotspots - defined as the top 100 grid cells ranked by predicted assaults as calculated by the model.  
+*    `Poverty`  - expressed as a percentage of the population in the grid cell.
+*    `Household Median Income` in 2019 inflated adjusted dollars. 
+*    `Population Density` - expressed as number of people per square mile.
+
+
+```{r}
+
+RF_Hotspots_20191231 <- leaflet(hotspot_cells_20191231 , 
+                                width = "100%"  , 
+                                height = "1080px"
+                                ) %>%
+    setView( lng = -78.6382,  lat = 35.83 , zoom = 12) %>%
+  addPolygons(color = "#444444", weight = 1, smoothFactor = 0.5,
+    opacity = 1.0, fillOpacity = 0.75,
+    fillColor = ~cell_palette(rank) ,
+    highlightOptions = highlightOptions(color = "yellow", 
+                                       weight = 3,
+                                       bringToFront = TRUE), 
+      label = ~lapply(Label, htmltools::HTML) ,
+      labelOptions = labelOptions(noHide = FALSE, direction = "bottom", style = list("font-size" = "15px", "box-shadow" = "3px 3px rgba(0,0,0,0.25)", "font-family" = "Helvetica")) ,
+      group = "Hotspots Predicted"
+    ) %>% 
+  addLegend( pal = cell_palette , values = ~rank,  title = "Hotspots Predicted"  ) %>%
+  
+  addPolygons(data = demographics_cells_20191231,
+              color = "#444444", weight = 1, smoothFactor = 0.5,
+    opacity = 1.0, fillOpacity = 0.5,
+    stroke = FALSE ,
+    fillColor = ~poverty_palette(poverty_pct) ,
+    highlightOptions = highlightOptions(color = "yellow", 
+                                       weight = 3,
+                                       bringToFront = TRUE), 
+      label = ~lapply(Label, htmltools::HTML) ,
+      labelOptions = labelOptions(noHide = FALSE, direction = "bottom", style = list("font-size" = "15px", "box-shadow" = "3px 3px rgba(0,0,0,0.25)", "font-family" = "Helvetica")) ,
+      group = "Poverty"
+    ) %>% 
+  addLegend( data = demographics_cells_20191231,  pal = poverty_palette , values = ~poverty_pct,  title = "Poverty %"  ) %>%
+  
+  addPolygons(data = demographics_cells_20191231,
+              color = "#444444", weight = 1, smoothFactor = 0.5,
+    opacity = 1.0, fillOpacity = 0.5,
+    stroke = FALSE ,
+    fillColor = ~income_palette(income) ,
+    highlightOptions = highlightOptions(color = "yellow", 
+                                       weight = 3,
+                                       bringToFront = TRUE), 
+      label = ~lapply(Label, htmltools::HTML) ,
+      labelOptions = labelOptions(noHide = FALSE, direction = "bottom", style = list("font-size" = "15px", "box-shadow" = "3px 3px rgba(0,0,0,0.25)", "font-family" = "Helvetica")) ,
+      group = "Household Median Income"
+    ) %>% 
+  addLegend( data = demographics_cells_20191231,  pal = income_palette , values = ~income,  title = "Household <br>Median Income"  ) %>%
+
+  addPolygons(data = demographics_cells_20191231,
+              color = "#444444", weight = 1, smoothFactor = 0.5,
+    opacity = 1.0, fillOpacity = 0.5,
+    stroke = FALSE ,
+    fillColor = ~density_palette(density) ,
+    highlightOptions = highlightOptions(color = "yellow", 
+                                       weight = 3,
+                                       bringToFront = TRUE), 
+      label = ~lapply(Label, htmltools::HTML) ,
+      labelOptions = labelOptions(noHide = FALSE, direction = "bottom", style = list("font-size" = "15px", "box-shadow" = "3px 3px rgba(0,0,0,0.25)", "font-family" = "Helvetica")) ,
+      group = "Population Density"
+    ) %>% 
+  addLegend( data = demographics_cells_20191231,  pal = density_palette , values = ~density,  title = "Population Density<br> sq. mile"  ) %>%
+
+  
+  addProviderTiles(providers$OpenStreetMap, group = "OSM") %>%
+  addProviderTiles(providers$CartoDB.Positron, group = "CartoDB Positron") %>%
+  addPolylines(data=gj_raleigh_buffer %>% st_transform(4326), 
+               color='green' , weight=4, group="Raleigh Limits") %>%
+  addLayersControl(baseGroups = c("CartoDB Positron", "OSM"),
+                   overlayGroups = c("Raleigh Limits","Hotspots Predicted", "Poverty", "Household Median Income", "Population Density"),
+                   options = layersControlOptions(collapsed = FALSE)) %>%
+  hideGroup("Poverty") %>%
+  hideGroup("Household Median Income") %>%
+  hideGroup("Population Density") %>%
+  addControl(rr, position = "bottomleft")
+
+
+saveWidget(RF_Hotspots_20191231 ,paste0(data_dir, "RF_Demographics_Hotspots_20191231.html"), selfcontained = TRUE)
+
+```
+
+
+
+# Mapping Crime Hotspots to POIs and All Assaults
+
+```{r load-pois}
+
+pois_raleigh_file = paste0(data_dir, "EXP_POIS_RALEIGH.geojson")
+pois_a_raleigh_file = paste0(data_dir, "EXP_POIS_A_RALEIGH.geojson")
+
+pois_raleigh = sf::st_read(pois_raleigh_file, quiet = TRUE ) %>% st_transform(4326)
+pois_a_raleigh = sf::st_read(pois_a_raleigh_file, quiet = TRUE ) %>% st_transform(4326)
+
+```
+
+
+
+```{r load-potholes}
+
+cityworks_potholes_file = paste0(data_dir, "Cityworks_Potholes.geojson" )
+
+gj_potholes = sf::st_read(cityworks_potholes_file, quiet = TRUE ) %>% st_transform(4326)
+
+# We exclude potholdes initiated after 2018 to avoid look-ahead bias
+# ------------------------------------------------------------------
+gj_potholes %>% filter( year(as_date(initiate_date)) <= 2018 ) %>% filter( !st_is_empty(.)) -> gj_potholes_historic
+
+gj_potholes_historic  %>% mutate( Label = paste0(   "Pothole" , "<br>",
+                                                    "<table>" ,
+                                                   "<tr><td>", "Start date:", "</td><td>"  , initiate_date, "</td></tr>" ,
+                                                   "<tr><td>", "Location:", "</td><td>"  , location , "</td></tr>" ,
+                                                   "<tr><td>", "workorder_id:","</td><td>" , workorder_id , "</td></tr>" ,
+                                                   "</table>" ) ) -> gj_potholes_historic
+
+```
+
+
+
+```{r filter-fclass}
+
+area_fclass = c("park", "swimming_pool", "playground", "hotel", "fast_food", "school", "restaurant", "bank", "track", "car_wash" , "sports_centre", "car_dealership", "supermarket", "golf_course" , 
+                "museum", "department_store", "university", "dentist", "pharmacy", "cafe" , "motel", "beauty_shop" , "bar" , "theatre", "cinema", "post_office" , "hospital", "nightclub", "courthouse" ,"prison" , 
+                "theme_park", "stadium" )
+
+point_fclass = c("restaurant", "fast_food", "supermarket", "bank", "cafe", "hairdresser", "beauty_shop", "school", "bar" , "pub", "convenience" , "car_dealership", "department_store" , "pharmacy" ,  "stadium" , 
+                 "hotel", "gift_shop", "university", "motel", "playground", "bakery" , "nightclub", "theatre", "cinema" )
+
+
+union_fclass = sort(union( area_fclass, point_fclass))
+
+pois_raleigh %>% filter( fclass %in% point_fclass) -> pois_to_use
+
+pois_a_raleigh %>% filter( fclass %in% area_fclass) -> pois_a_to_use
+
+```
+
+
+```{r}
+
+union_poi_palette <- colorFactor(palette = "plasma", domain = union_fclass )
+
+
+pois_to_use %>% mutate( Label = paste0(  "<table>" ,
+                                                   "<tr><td>", "POI Type:", "</td><td>"  , fclass, "</td></tr>" ,
+                                                   "<tr><td>", "Name:", "</td><td>"  , name , "</td></tr>" ,
+                                                   "<tr><td>", "osm_id:","</td><td>" , osm_id , "</td></tr>" ,
+                                                   "</table>" ) ) -> pois_to_use
+
+
+pois_a_to_use %>% mutate( Label = paste0(  "<table>" ,
+                                                   "<tr><td>", "POI Type:", "</td><td>"  , fclass, "</td></tr>" ,
+                                                   "<tr><td>", "Name:", "</td><td>"  , name , "</td></tr>" ,
+                                                   "<tr><td>", "osm_id:","</td><td>" , osm_id , "</td></tr>" ,
+                                                   "</table>" ) ) -> pois_a_to_use
+
+
+```
+
+
+## Random Forests - POI
+
+```{r}
+
+
+
+rpoi <- tags$div(HTML('<h3>Assaults: Actual and Predicted</h3><br>2020 Forecasts + Realized<br>with Points of Interest, Potholes<br>Random Forest Model<br>Raleigh, NC<br>Alexander Ng' ) )
+
+
+crime_palette <- colorBin("Reds",  bins = c( 0, 1, 3, 5, 10, 30, 40, 80) , na.color = "red" )
+
+
+actual_crime_palette <- colorBin("Blues",  bins = c( 0, 1, 3, 5, 10, 30, 40, 80) , na.color = "blue" )
+
+crime_labels <- c( "<= 1", "<= 3", "<= 5", "<=10", "<=30", "<=40", "<=80", ">80")
+
+demographics_cells_20191231 %>%  mutate( Label = paste0( "<br><b>Hotspot :</b>",rank , "</b>", 
+                                 
+                                                   "<br><b>","Assaults 2020 ", "</b>" ,
+                                                   "<table>" ,
+                                                   "<tr><td>", "Predicted:", "</td><td>"    , round(pred_crime_freq, 1) , "</td></tr>" ,
+                                                   "<tr><td>", "       2020:", "</td><td>"  , crime_freq , "</td></tr>" ,
+                                                   "<tr><td>", "       2019:", "</td><td>"  , round(0.5 * ( crime_freq_6M + crime_freq_1Y), 0) , "</td></tr>" ,
+                                                   "<tr><td>", "       2018:", "</td><td>"  , crime_freq_2Y , "</td></tr>" ,
+                                                   "<tr><td>", "       2017:", "</td><td>"  , crime_freq_3Y, "</td></tr>" ,
+                                                   "</table>"
+                                                            )) -> demographics_cells_20191231
+
+
+POI_Hotspots_20191231 <- leaflet(hotspot_cells_20191231 , 
+                                width = "100%"  , 
+                                height = "1080px"
+                                ) %>%
+    setView( lng = -78.6382,  lat = 35.83 , zoom = 12) %>%
+  
+    addPolygons(data = demographics_cells_20191231,
+              color = "lightgray", weight = 1, smoothFactor = 0.5,
+    opacity = 1.0, fillOpacity = 0.5,
+    stroke = TRUE ,
+    fillColor = ~crime_palette(pred_crime_freq) ,
+    highlightOptions = highlightOptions(color = "yellow", 
+                                       weight = 3,
+                                       bringToFront = TRUE), 
+      label = ~lapply(Label, htmltools::HTML) ,
+      labelOptions = labelOptions(noHide = FALSE, direction = "bottom", style = list("font-size" = "15px", "box-shadow" = "3px 3px rgba(0,0,0,0.25)", "font-family" = "Helvetica")) ,
+      group = "Assaults Predicted"
+    ) %>% 
+  addLegend( data = demographics_cells_20191231,  pal = crime_palette , values = ~pred_crime_freq ,  title = "All Assaults<br>Predicted"  , position = "topleft") %>%
+    addPolygons(data = demographics_cells_20191231,
+              color = "lightgray", weight = 1, smoothFactor = 0.5,
+    opacity = 1.0, fillOpacity = 0.5,
+    stroke = TRUE ,
+    fillColor = ~actual_crime_palette(crime_freq) ,
+    highlightOptions = highlightOptions(color = "yellow", 
+                                       weight = 3,
+                                       bringToFront = TRUE), 
+      label = ~lapply(Label, htmltools::HTML) ,
+      labelOptions = labelOptions(noHide = FALSE, direction = "bottom", style = list("font-size" = "15px", "box-shadow" = "3px 3px rgba(0,0,0,0.25)", "font-family" = "Helvetica")) ,
+      group = "Assaults Actual"
+    ) %>% 
+  addLegend( data = demographics_cells_20191231,  pal = actual_crime_palette , values = ~crime_freq ,  title = "All Assaults<br>Actual" , position = "topleft" ) %>%
+  addPolygons(data = hotspot_cells_20191231 , 
+              color = "#444444", weight = 1, smoothFactor = 0.5,
+    opacity = 1.0, fillOpacity = 0.75,
+    fillColor = ~cell_palette(rank) ,
+    highlightOptions = highlightOptions(color = "yellow", 
+                                       weight = 3,
+                                       bringToFront = TRUE), 
+      label = ~lapply(Label, htmltools::HTML) ,
+      labelOptions = labelOptions(noHide = FALSE, direction = "bottom", style = list("font-size" = "15px", "box-shadow" = "3px 3px rgba(0,0,0,0.25)", "font-family" = "Helvetica")) ,
+      group = "Hotspots Predicted"
+    ) %>% 
+  addLegend( pal = cell_palette , values = ~rank,   title = "Top 100 Hotspots<br>Ranked"  ) %>%
+
+  addPolygons( data = pois_a_to_use , 
+               color = "#444444", weight = 1, smoothFactor = 0.5,
+               opacity = 1.0, fillOpacity = 0.5,
+               fillColor = "orange" ,
+               highlightOptions = highlightOptions(color = "yellow", 
+                                       weight = 3,
+                                       bringToFront = TRUE), 
+               
+               labelOptions = labelOptions(noHide = FALSE, direction = "bottom", style = list("font-size" = "15px", "box-shadow" = "3px 3px rgba(0,0,0,0.25)", "font-family" = "Helvetica")) ,
+               label = ~lapply(Label, htmltools::HTML), group = "Points of Interest - A") %>%
+  
+  addCircleMarkers( data = gj_potholes_historic, label = ~lapply(Label, htmltools::HTML), 
+                    labelOptions = labelOptions(noHide = FALSE, direction = "bottom", style = list("font-size" = "15px", "box-shadow" = "3px 3px rgba(0,0,0,0.25)", "font-family" = "Helvetica")) ,
+                    color = "red", radius = 4, group = "Potholes" ) %>%
+  addCircleMarkers( data = pois_to_use, label = ~lapply(Label, htmltools::HTML), 
+                    labelOptions = labelOptions(noHide = FALSE, direction = "bottom", style = list("font-size" = "15px", "box-shadow" = "3px 3px rgba(0,0,0,0.25)", "font-family" = "Helvetica")) ,
+                    color = ~union_poi_palette(fclass), radius = 5, group = "Points of Interest - P" ) %>%
+  addLegend( data  = pois_to_use, pal = union_poi_palette , values = ~fclass ,   title = "Points of Interest"  ) %>%
+  
+  
+  addProviderTiles(providers$OpenStreetMap, group = "OSM") %>%
+  addProviderTiles(providers$CartoDB.Positron, group = "CartoDB Positron") %>%
+  addPolylines(data=gj_raleigh_buffer %>% st_transform(4326), 
+               color='green' , weight=4, group="Raleigh Limits") %>%
+  addLayersControl(baseGroups = c("CartoDB Positron", "OSM"),
+                   overlayGroups = c("Raleigh Limits","Hotspots Predicted" , "Assaults Predicted", "Assaults Actual", "Points of Interest - P", "Points of Interest - A", "Potholes"),
+                   options = layersControlOptions(collapsed = FALSE)) %>%
+  hideGroup("Potholes") %>%
+  hideGroup("Points of Interest - P") %>%
+  hideGroup("Points of Interest - A") %>%
+  hideGroup("Assaults Predicted") %>%
+  hideGroup("Hotspots Predicted") %>%
+  addControl(rpoi, position = "bottomleft")
+
+
+saveWidget(POI_Hotspots_20191231 ,paste0(data_dir, "RF_POI_Hotspots_20191231.html" ), selfcontained = TRUE)
+
+
+```
+
+
+
+## Cubist Leaflet Map - Demographics
+
+```{r load-cu-grid-output}
+
+# Load the grid cells from random forest. Add HTML table as label when hovering.
+# ---------------------------------------------------------------------------------
+hotspot_cells_20191231 <- PAI_cu_ranked_grid_20191231 %>% 
+                                    filter( hotspot==1) %>% 
+                                    st_transform(4326) %>% 
+                                    mutate( Label = paste0( "<br><b>Hotspot :</b>",rank , "</b>", 
+                                                   "<br><b>","Assaults 2020 ", "</b>" ,
+                                                   "<table>" ,
+                                                   "<tr><td>", "Predicted:", "</td><td>"    , round(pred_crime_freq, 1) , "</td></tr>" ,
+                                                   "<tr><td>", "       2020:", "</td><td>"  , crime_freq , "</td></tr>" ,
+                                                   "<tr><td>", "       2019:", "</td><td>"  , round(0.5 * ( crime_freq_6M + crime_freq_1Y), 0) , "</td></tr>" ,
+                                                   "<tr><td>", "       2018:", "</td><td>"  , crime_freq_2Y , "</td></tr>" ,
+                                                   "<tr><td>", "       2017:", "</td><td>"  , crime_freq_3Y, "</td></tr>" ,
+                                                   "</table>"
+                                                            ))
+
+#
+# Save the crime grid.  Add HTML table for label when hovering over each cell.
+# ---------------------------------------------------------------------------------
+demographics_cells_20191231 <-  PAI_cu_ranked_grid_20191231 %>%  
+                                    st_transform(4326) %>%
+                                    mutate( poverty_pct = 100 * poverty_rate , 
+                                            unemployment_pct = 100 * unemployment_rate ,
+                                                Label = paste0( "<br><b>Demographics :</b>", 
+                                                   "<br>",
+                                                   "<table>" ,
+                                                   "<tr><td>", "Poverty Rate%:", "</td><td>"  , round(poverty_pct, 1), "</td></tr>" ,
+                                                   "<tr><td>", "      Income:", "</td><td>$"  , round(income,0) , "</td></tr>" ,
+                                                   "<tr><td>", "Unemployment%:", "</td><td>"  , round( unemployment_pct , 1) , "</td></tr>" ,
+                                                   "<tr><td>", "      Density #/sq mile:", "</td><td>"  , round(density,0) , "</td></tr>" ,
+                                                   "</table>"  )) 
+
+
+cell_palette <- colorBin("Spectral", hotspot_cells_20191231$rank , 5 )
+
+poverty_palette <- colorNumeric("Greens", demographics_cells_20191231$poverty_pct , 5 )
+
+density_palette <- colorNumeric("Oranges", demographics_cells_20191231$density , 5 )
+
+income_palette <- colorNumeric("RdYlBu", demographics_cells_20191231$income , 5 )
+
+
+
+```
+
+
+```{r}
+
+CU_Hotspots_20191231 <- leaflet(hotspot_cells_20191231 , 
+                                width = "100%"  , 
+                                height = "1080px"
+                                ) %>%
+    setView( lng = -78.6382,  lat = 35.83 , zoom = 12) %>%
+  addPolygons(color = "#444444", weight = 1, smoothFactor = 0.5,
+    opacity = 1.0, fillOpacity = 0.75,
+    fillColor = ~cell_palette(rank) ,
+    highlightOptions = highlightOptions(color = "yellow", 
+                                       weight = 3,
+                                       bringToFront = TRUE), 
+      label = ~lapply(Label, htmltools::HTML) ,
+      labelOptions = labelOptions(noHide = FALSE, direction = "bottom", style = list("font-size" = "15px", "box-shadow" = "3px 3px rgba(0,0,0,0.25)", "font-family" = "Helvetica")) ,
+      group = "Hotspots Predicted"
+    ) %>% 
+  addLegend( pal = cell_palette , values = ~rank,  title = "Hotspots Predicted"  ) %>%
+  
+  addPolygons(data = demographics_cells_20191231,
+              color = "#444444", weight = 1, smoothFactor = 0.5,
+    opacity = 1.0, fillOpacity = 0.5,
+    stroke = FALSE ,
+    fillColor = ~poverty_palette(poverty_pct) ,
+    highlightOptions = highlightOptions(color = "yellow", 
+                                       weight = 3,
+                                       bringToFront = TRUE), 
+      label = ~lapply(Label, htmltools::HTML) ,
+      labelOptions = labelOptions(noHide = FALSE, direction = "bottom", style = list("font-size" = "15px", "box-shadow" = "3px 3px rgba(0,0,0,0.25)", "font-family" = "Helvetica")) ,
+      group = "Poverty"
+    ) %>% 
+  addLegend( data = demographics_cells_20191231,  pal = poverty_palette , values = ~poverty_pct,  title = "Poverty %"  ) %>%
+  
+  addPolygons(data = demographics_cells_20191231,
+              color = "#444444", weight = 1, smoothFactor = 0.5,
+    opacity = 1.0, fillOpacity = 0.5,
+    stroke = FALSE ,
+    fillColor = ~income_palette(income) ,
+    highlightOptions = highlightOptions(color = "yellow", 
+                                       weight = 3,
+                                       bringToFront = TRUE), 
+      label = ~lapply(Label, htmltools::HTML) ,
+      labelOptions = labelOptions(noHide = FALSE, direction = "bottom", style = list("font-size" = "15px", "box-shadow" = "3px 3px rgba(0,0,0,0.25)", "font-family" = "Helvetica")) ,
+      group = "Household Median Income"
+    ) %>% 
+  addLegend( data = demographics_cells_20191231,  pal = income_palette , values = ~income,  title = "Household <br>Median Income"  ) %>%
+
+  addPolygons(data = demographics_cells_20191231,
+              color = "#444444", weight = 1, smoothFactor = 0.5,
+    opacity = 1.0, fillOpacity = 0.5,
+    stroke = FALSE ,
+    fillColor = ~density_palette(density) ,
+    highlightOptions = highlightOptions(color = "yellow", 
+                                       weight = 3,
+                                       bringToFront = TRUE), 
+      label = ~lapply(Label, htmltools::HTML) ,
+      labelOptions = labelOptions(noHide = FALSE, direction = "bottom", style = list("font-size" = "15px", "box-shadow" = "3px 3px rgba(0,0,0,0.25)", "font-family" = "Helvetica")) ,
+      group = "Population Density"
+    ) %>% 
+  addLegend( data = demographics_cells_20191231,  pal = density_palette , values = ~density,  title = "Population Density<br> sq. mile"  ) %>%
+
+  
+  addProviderTiles(providers$OpenStreetMap, group = "OSM") %>%
+  addProviderTiles(providers$CartoDB.Positron, group = "CartoDB Positron") %>%
+  addPolylines(data=gj_raleigh_buffer %>% st_transform(4326), 
+               color='green' , weight=4, group="Raleigh Limits") %>%
+  addLayersControl(baseGroups = c("CartoDB Positron", "OSM"),
+                   overlayGroups = c("Raleigh Limits","Hotspots Predicted", "Poverty", "Household Median Income", "Population Density"),
+                   options = layersControlOptions(collapsed = FALSE)) %>%
+  hideGroup("Poverty") %>%
+  hideGroup("Household Median Income") %>%
+  hideGroup("Population Density") %>%
+  addControl(rc, position = "bottomleft")
+
+
+saveWidget(CU_Hotspots_20191231 ,paste0(data_dir, "CU_Demographics_Hotspots_20191231.html"), selfcontained = TRUE)
+
+```
+
+
+
+
+## Cubist - POI
+
+```{r}
+
+
+
+cpoi <- tags$div(HTML('<h3>Assaults: Actual and Predicted</h3><br>2020 Forecasts + Realized<br>with Points of Interest, Potholes<br>Cubist Model<br>Raleigh, NC<br>Alexander Ng' ) )
+
+
+crime_palette <- colorBin("Reds",  bins = c( 0, 1, 3, 5, 10, 30, 40, 80) , na.color = "red" )
+
+
+actual_crime_palette <- colorBin("Blues",  bins = c( 0, 1, 3, 5, 10, 30, 40, 80) , na.color = "blue" )
+
+crime_labels <- c( "<= 1", "<= 3", "<= 5", "<=10", "<=30", "<=40", "<=80", ">80")
+
+demographics_cells_20191231 %>%  mutate( Label = paste0( "<br><b>Hotspot :</b>",rank , "</b>", 
+                                 
+                                                   "<br><b>","Assaults 2020 ", "</b>" ,
+                                                   "<table>" ,
+                                                   "<tr><td>", "Predicted:", "</td><td>"    , round(pred_crime_freq, 1) , "</td></tr>" ,
+                                                   "<tr><td>", "       2020:", "</td><td>"  , crime_freq , "</td></tr>" ,
+                                                   "<tr><td>", "       2019:", "</td><td>"  , round(0.5 * ( crime_freq_6M + crime_freq_1Y), 0) , "</td></tr>" ,
+                                                   "<tr><td>", "       2018:", "</td><td>"  , crime_freq_2Y , "</td></tr>" ,
+                                                   "<tr><td>", "       2017:", "</td><td>"  , crime_freq_3Y, "</td></tr>" ,
+                                                   "</table>"
+                                                            )) -> demographics_cells_20191231
+
+
+POI_Hotspots_20191231 <- leaflet(hotspot_cells_20191231 , 
+                                width = "100%"  , 
+                                height = "1080px"
+                                ) %>%
+    setView( lng = -78.6382,  lat = 35.83 , zoom = 12) %>%
+  
+    addPolygons(data = demographics_cells_20191231,
+              color = "lightgray", weight = 1, smoothFactor = 0.5,
+    opacity = 1.0, fillOpacity = 0.5,
+    stroke = TRUE ,
+    fillColor = ~crime_palette(pred_crime_freq) ,
+    highlightOptions = highlightOptions(color = "yellow", 
+                                       weight = 3,
+                                       bringToFront = TRUE), 
+      label = ~lapply(Label, htmltools::HTML) ,
+      labelOptions = labelOptions(noHide = FALSE, direction = "bottom", style = list("font-size" = "15px", "box-shadow" = "3px 3px rgba(0,0,0,0.25)", "font-family" = "Helvetica")) ,
+      group = "Assaults Predicted"
+    ) %>% 
+  addLegend( data = demographics_cells_20191231,  pal = crime_palette , values = ~pred_crime_freq ,  title = "All Assaults<br>Predicted"  , position = "topleft") %>%
+    addPolygons(data = demographics_cells_20191231,
+              color = "lightgray", weight = 1, smoothFactor = 0.5,
+    opacity = 1.0, fillOpacity = 0.5,
+    stroke = TRUE ,
+    fillColor = ~actual_crime_palette(crime_freq) ,
+    highlightOptions = highlightOptions(color = "yellow", 
+                                       weight = 3,
+                                       bringToFront = TRUE), 
+      label = ~lapply(Label, htmltools::HTML) ,
+      labelOptions = labelOptions(noHide = FALSE, direction = "bottom", style = list("font-size" = "15px", "box-shadow" = "3px 3px rgba(0,0,0,0.25)", "font-family" = "Helvetica")) ,
+      group = "Assaults Actual"
+    ) %>% 
+  addLegend( data = demographics_cells_20191231,  pal = actual_crime_palette , values = ~crime_freq ,  title = "All Assaults<br>Actual" , position = "topleft" ) %>%
+  addPolygons(data = hotspot_cells_20191231 , 
+              color = "#444444", weight = 1, smoothFactor = 0.5,
+    opacity = 1.0, fillOpacity = 0.75,
+    fillColor = ~cell_palette(rank) ,
+    highlightOptions = highlightOptions(color = "yellow", 
+                                       weight = 3,
+                                       bringToFront = TRUE), 
+      label = ~lapply(Label, htmltools::HTML) ,
+      labelOptions = labelOptions(noHide = FALSE, direction = "bottom", style = list("font-size" = "15px", "box-shadow" = "3px 3px rgba(0,0,0,0.25)", "font-family" = "Helvetica")) ,
+      group = "Hotspots Predicted"
+    ) %>% 
+  addLegend( pal = cell_palette , values = ~rank,   title = "Top 100 Hotspots<br>Ranked"  ) %>%
+
+  addPolygons( data = pois_a_to_use , 
+               color = "#444444", weight = 1, smoothFactor = 0.5,
+               opacity = 1.0, fillOpacity = 0.5,
+               fillColor = "orange" ,
+               highlightOptions = highlightOptions(color = "yellow", 
+                                       weight = 3,
+                                       bringToFront = TRUE), 
+               
+               labelOptions = labelOptions(noHide = FALSE, direction = "bottom", style = list("font-size" = "15px", "box-shadow" = "3px 3px rgba(0,0,0,0.25)", "font-family" = "Helvetica")) ,
+               label = ~lapply(Label, htmltools::HTML), group = "Points of Interest - A") %>%
+  
+  addCircleMarkers( data = gj_potholes_historic, label = ~lapply(Label, htmltools::HTML), 
+                    labelOptions = labelOptions(noHide = FALSE, direction = "bottom", style = list("font-size" = "15px", "box-shadow" = "3px 3px rgba(0,0,0,0.25)", "font-family" = "Helvetica")) ,
+                    color = "red", radius = 4, group = "Potholes" ) %>%
+  addCircleMarkers( data = pois_to_use, label = ~lapply(Label, htmltools::HTML), 
+                    labelOptions = labelOptions(noHide = FALSE, direction = "bottom", style = list("font-size" = "15px", "box-shadow" = "3px 3px rgba(0,0,0,0.25)", "font-family" = "Helvetica")) ,
+                    color = ~union_poi_palette(fclass), radius = 5, group = "Points of Interest - P" ) %>%
+  addLegend( data  = pois_to_use, pal = union_poi_palette , values = ~fclass ,   title = "Points of Interest"  ) %>%
+  
+  
+  addProviderTiles(providers$OpenStreetMap, group = "OSM") %>%
+  addProviderTiles(providers$CartoDB.Positron, group = "CartoDB Positron") %>%
+  addPolylines(data=gj_raleigh_buffer %>% st_transform(4326), 
+               color='green' , weight=4, group="Raleigh Limits") %>%
+  addLayersControl(baseGroups = c("CartoDB Positron", "OSM"),
+                   overlayGroups = c("Raleigh Limits","Hotspots Predicted" , "Assaults Predicted", "Assaults Actual", "Points of Interest - P", "Points of Interest - A", "Potholes"),
+                   options = layersControlOptions(collapsed = FALSE)) %>%
+  hideGroup("Potholes") %>%
+  hideGroup("Points of Interest - P") %>%
+  hideGroup("Points of Interest - A") %>%
+  hideGroup("Assaults Predicted") %>%
+  hideGroup("Hotspots Predicted") %>%
+  addControl(cpoi, position = "bottomleft")
+
+
+saveWidget(POI_Hotspots_20191231 ,paste0(data_dir, "CU_POI_Hotspots_20191231.html" ), selfcontained = TRUE)
+
+
+```
+
+## TAB 2
+
+### Cubist POI Hotspots 2020
+
+```{r out.width='100%'}
+
+POI_Hotspots_20191231
+```
+## TAB 3
+
+### Cubist Demographics 2020
+
+```{r out.width = '100%'}
+CU_Hotspots_20191231
+
+```

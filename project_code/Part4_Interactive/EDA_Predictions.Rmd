@@ -1,0 +1,247 @@
+---
+title: "EDA Predictions"
+author: "Alexander Ng"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output:
+  html_document:
+    df_print: paged
+    highlight: tango
+    number_sections: yes
+    theme: readable
+    toc: yes
+    toc_depth: 2
+    toc_float: no
+    fontsize: 12
+  pdf_document:
+    toc: yes
+    toc_depth: '2'
+subtitle: Production
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+```{r message=FALSE, warning=FALSE}
+suppressPackageStartupMessages(library(knitr) )
+suppressPackageStartupMessages( library(tidyverse) )
+suppressPackageStartupMessages(library(kableExtra) )
+
+suppressPackageStartupMessages(library(sf))
+suppressPackageStartupMessages(library(caret))
+library(ggspatial)
+library(cowplot)
+library(Cubist)
+library(ranger)
+library(cowplot)
+library(skimr)
+library(viridis)
+library(RColorBrewer)
+library(leaflet)
+library(htmltools)
+library(htmlwidgets)
+library(lubridate)
+library(tidygeocoder)
+
+```
+
+# Introduction
+
+The objective of this analysis is to build interactive visualizations of predicted crime hotspots, actual crime behaviour and the predictors in Raleigh, North Carolina.
+Due to the large volume of data, we divide the analyses into two maps.  One map depicts the hotspots together with demographic predictors.   The second map depicts the hotspots
+together with points of interest predictors and all predicted crime in the city.
+
+
+# Configuration and File Import
+
+The model output was pre-generated.
+We will load the Models for the 2020 test period.   Base date is 2019-12-31.
+
+
+```{r configuration, echo = FALSE}
+
+proj_dir = "/Volumes/GDRIVE_SSD/homes/alex/datascience/698_CAPSTONE_2021_FALL"
+working_dir = paste0(proj_dir, "/", "project_code/Part4_Interactive/")
+data_dir = paste0(proj_dir, "/project_data/")
+
+setwd(working_dir)
+```
+
+
+
+```{r define-model-result-files-2019}
+
+PAI_cubist_ranked_grid_20191231_file = paste0(data_dir, "EXP_CUBIST_PAI_RANKED_GRID_2019-12-31.geojson")
+
+PEI_cubist_csv_grid_20191231_file = paste(data_dir, "EXP_CUBIST_PEI_RANKED_CSV_2019-12-31.csv")
+
+PAI_rf_ranked_grid_20191231_file = paste0(data_dir, "EXP_RANDOMFOREST_PAI_RANKED_GRID_2019-12-31.geojson")
+
+PEI_rf_csv_grid_20191231_file = paste(data_dir, "EXP_RANDOMFOREST_PEI_RANKED_CSV_2019-12-31.csv")
+
+```
+
+```{r map-file-load}
+raleigh_corporate_limits_file = paste0(data_dir, "Corporate_Limits.geojson")
+
+```
+
+```{r load-raleigh-boundary}
+#
+# Load the geojson files
+# change the coordinate system to 2264
+# filter objects that belong to RALEIGHT
+# --------------------------------------------
+gj_raleigh <- sf::st_read(raleigh_corporate_limits_file, quiet = TRUE) %>% 
+  st_transform(2264) %>% 
+  filter( SHORT_NAME == 'RAL' )
+
+gj_raleigh_buffer = st_buffer(gj_raleigh, dist = 100 ) %>% st_union() %>% st_sf() 
+
+```
+
+```{r load-PAI-cubist-grid}
+
+PAI_cu_ranked_grid_20191231 <- sf::st_read( PAI_cubist_ranked_grid_20191231_file, quiet = TRUE ) %>%
+    st_transform(2264) 
+
+PAI_rf_ranked_grid_20191231 <- sf::st_read( PAI_rf_ranked_grid_20191231_file, quiet = TRUE ) %>%
+    st_transform(2264) 
+
+```
+
+# Properties of Assaults on the Grid
+
+```{r}
+PAI_rf_ranked_grid_20191231 %>% st_drop_geometry() %>% 
+  group_by( crime_freq ) %>% 
+  summarize( count = n() ) %>% 
+  mutate( pct_crime = 100 * count/sum(count) ) %>% ggplot(aes( x = reorder( as.factor(crime_freq), desc(crime_freq) ), 
+                                                               y = pct_crime )) + geom_bar(stat = "identity") + coord_flip() +
+   geom_text(aes(label = round(pct_crime, 2)), hjust = 1 , color = "red") +
+  labs(title = "Assaults on Raleigh Grid", subtitle = "Actual 2020 Assaults", x = "Incidents per Grid Cell", y = "% of Total" ) -> p
+
+ranked_grid_assaults_file = paste0(data_dir, "EXP_RANDOMFOREST_BARPLOT_RANKED_GRID_2020.png")
+
+cowplot::save_plot(  ranked_grid_assaults_file, p , base_width = 6  )
+
+p
+
+```
+
+# Sensitivity
+
+```{r}
+
+PAI_rf_ranked_grid_20191231 %>% 
+  st_drop_geometry() %>% 
+  group_by(hotspot) %>% 
+  skim() %>% 
+  yank("numeric") %>%
+  filter( !( skim_variable %in% c( 'id_grid', 'cols', 'rows', 'rank', 'area', 'lon', 'lat',
+                                   'PAI', 'RRI', 'cum_area', 'prop_cum_area' ,
+                                   'cum_crime_freq', 'prop_cum_crime_freq') ) ) %>%
+  select( skim_variable, hotspot, mean, p50) %>%
+  rename( variable = skim_variable) %>% 
+  select( variable, hotspot, mean) %>%
+  group_by( variable) %>%
+  mutate( p = ifelse( hotspot > 0 , mean, (sum(mean)-mean))/sum(mean) ) %>%
+  ungroup() 
+# %>% filter(variable == 'income')
+# %>% pivot_wider( names_from = hotspot, values_from = mean) %>% kable(digits = 3) %>% kable_styling(bootstrap_options = c("hover", "striped"))
+
+
+```
+
+
+```{r}
+PAI_rf_ranked_grid_20191231 %>% 
+  st_drop_geometry() %>% 
+  group_by(hotspot) %>% 
+  skim() %>% 
+  yank("numeric") %>%
+  filter( !( skim_variable %in% c( 'id_grid', 'cols', 'rows', 'rank', 'area', 'lon', 'lat', 'crime_count', 
+                                   'crime_count_3Y', 'crime_count_2Y', 'crime_count_1Y', 'crime_count_6M', 
+                                   'PAI', 'RRI', 'cum_area', 'prop_cum_area' ,
+                                   'cum_crime_freq', 'prop_cum_crime_freq') ) ) %>%
+  select( skim_variable, hotspot, mean, p50) %>%
+  rename( variable = skim_variable) %>% 
+  select( variable, hotspot, mean) %>%
+  group_by( variable) %>%
+  mutate( p = ifelse( hotspot==1 , mean, sum(mean) - mean ) /sum(mean) ) %>%
+  ungroup() %>%
+  ggplot(aes(fill = as.factor(hotspot), y = mean, x = reorder(variable, p) ) ) + geom_bar(position = "fill", stat="identity", width = 0.8) +
+   scale_fill_manual("legend", values = c("0" = "lightblue", "1"="orange")) +
+  labs( y = "Proportion", x = "Variable", fill = "Hot Spot", 
+        title = "Ratio of Variable for Hotspots vs. Non-Spots" ,
+        subtitle = "Random Forest - 2020 test period") +
+  theme(aspect.ratio = 1/3, axis.text.x = element_text(angle = 90, hjust = .95, vjust = 0.2 ) ) -> plot_variables_hotspot
+
+plot_variables_hotspot
+
+cowplot::save_plot( paste0(data_dir, "EXP_RANDOMFOREST_PREDICTORS_HOTSPLOT_PLOT_2020.png" ), plot_variables_hotspot  , base_height = 6 )
+
+```
+
+```{r out.width='100%' }
+PAI_rf_ranked_grid_20191231 %>% filter(rank <= 10 ) %>%
+  select( rank, lon, lat, id_grid, crime_freq, PAI, RRI, prop_cum_area, prop_cum_crime_freq ) %>%  st_drop_geometry() %>%
+  tidygeocoder::reverse_geocode(lat = lat, long = lon, address = "address") %>%  
+  select(rank, id_grid, crime_freq, PAI, prop_cum_area, prop_cum_crime_freq,address ) %>% 
+  kable(digits = 2, caption = "Top 15 Crime Hotspots") %>%
+  kable_styling(bootstrap_options = c("hover", "striped"
+                                ))
+  
+
+```
+
+
+Save the rank table to file.
+
+```{r out.width='100%' }
+PAI_rf_ranked_grid_20191231 %>% filter(rank <= 10 ) %>%
+  select( rank, lon, lat, id_grid, crime_freq, PAI, RRI, prop_cum_area, prop_cum_crime_freq ) %>%  st_drop_geometry() %>%
+  tidygeocoder::reverse_geocode(lat = lat, long = lon, address = "address") -> PAI_rf_ranked_revgeocode_top10
+
+PAI_rf_ranked_revgeocode_top10 %>% write_rds(paste0(data_dir, "EXP_PAI_RANKED_REVGEOCODE_RANDOMFOREST_2020_TOP10.rds") )
+                                
+
+```
+
+```{r}
+
+gj_assault_geocoded = st_read(paste0(data_dir, "EXP_EDA_RALEIGH_assaults_Aug2021.geojson" ), quiet = TRUE )
+
+```
+
+```{r}
+grid_cellsize = 490
+
+# We need the grid cell buffer file name for export and later import
+grid_buffer_file = paste0(data_dir, "EXP_GRID_RALEIGH_BUFFER_", grid_cellsize, ".geojson")
+
+```
+
+
+```{r load-city-buffered-grid, echo = FALSE}
+# Now we load the grid from file.
+
+grid_raleigh_buffer = sf::st_read(grid_buffer_file, quiet = TRUE ) %>% st_transform(2264)
+
+# Let's check it loading properly
+
+dim(grid_raleigh_buffer)
+
+```
+
+
+```{r}
+gj_assault2grid <- gj_assault_geocoded %>% st_join(grid_raleigh_buffer) %>% filter( !is.na( id_grid  ))
+
+
+```
+
+```{r}
+
+
+```

@@ -1,0 +1,503 @@
+---
+title: "Crime Grid"
+author: "Alexander Ng"
+date: "10/14/2021"
+output: 
+  html_document:
+    df_print: paged
+    highlight: tango
+    number_sections: yes
+    theme: readable
+    toc: yes
+    toc_depth: 2
+    toc_float: no
+    fontsize: 12
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(kableExtra)
+library(sf)
+library(ggspatial)
+library(raster)
+library(stars)
+library(spatstat)
+library(cowplot)
+```
+
+# Goal
+
+The goal of this file is to experiment with crime grids.
+
+
+
+# Loading the Map Data Files
+
+```{r define-dirs}
+proj_dir = "/Volumes/GDRIVE_SSD/homes/alex/datascience/698_CAPSTONE_2021_FALL"
+
+working_dir = paste0(proj_dir, "/", "project_code/Part2_GeoMapping/")
+
+data_dir = paste0(proj_dir, "/project_data/")
+
+setwd(working_dir)
+
+```
+
+```{r map-file-load}
+raleigh_corporate_limits_file = paste0(data_dir, "Corporate_Limits.geojson")
+
+```
+
+
+
+```{r load-raleigh-boundary}
+#
+# Load the geojson files
+# change the coordinate system to 2264
+# filter objects that belong to RALEIGHT
+# --------------------------------------------
+gj_raleigh <- sf::st_read(raleigh_corporate_limits_file, quiet = TRUE) %>% 
+  st_transform(2264) %>% 
+  filter( SHORT_NAME == 'RAL' )
+
+```
+
+We compute the area of the polygonal representation and validate by checking against Wikipedia's reported area.
+They are very close.
+
+```{r}
+# Compute the total square miles of the polygons.
+# The NAD83 North Carolina projection uses square ft.
+# ------------------------------------------------------
+area_of_polygons = st_area(gj_raleigh)
+
+sprintf( "Raleigh Area is: %.2f square miles.  Wikipedia gives: 147.64 sq mi" , sum(area_of_polygons) / ( 5280^2)  )
+
+```
+
+
+# Visualization
+
+## Plotting the City and Base Layer
+
+
+
+Fill the interior with color and add a border in red.
+
+```{r}
+gj_raleigh %>% ggplot() + geom_sf( fill = "skyblue", color = "darkred", size = 0.1) + 
+  labs(title = "Raleigh City Limits in Color")
+```
+
+Let's put a basemap tile underneath and  compass rose and alpha blend.
+
+```{r}
+gj_raleigh %>% ggplot() + geom_sf( fill = "skyblue", color = "darkred") + 
+  labs(title = "Raleigh City:  Basemap , Compass, Alpha Blending") +
+  annotation_map_tile(type="osm", progress = "none", alpha = 0.5 ) +
+  annotation_north_arrow(location="bl", which_north = "true")
+```
+## Make Grid Cells and Plot Them
+
+```{r}
+# This gives measurements in feet.
+grid_cellsize = 5000
+
+```
+
+The code below makes a grid of size $N=$ `r grid_cellsize` units.   Experiment suggest the grid units are in feet because the `st_area` call applied to the grid gives a cell area of $N^2$ units in squared feet.
+
+The bounding box of the grid cells starts in the lower left (South West) $A$ where the vertical line $x=v(A)$ through $A$ and the horizontal line $y=h(A)$ through $A$ are tangent to the city boundary and are left and lower bounds respectively.   
+
+The upper right corner (North East) does not have to be tangent to the city limits.  
+ --  the vertical line $x=v(C)$ must have a horizontal distance which is an integer multiple of `grid_cellsize` from $x=v(A)$.
+          $$v(C) - v(A) = m \cdot \Delta(Grid) \text{ for some positive integer } m > 0$$
+ 
+ --  the horizontal line $y=h(C)$ must have a vertical distance which is an integer multiple of `grid_cellsize` from $y=h(A)$.
+         $$h(C) - h(A) = n \cdot \Delta(Grid) \text{ for some positive integer } n > 0$$
+
+
+```{r}
+
+a1 = st_make_valid(gj_raleigh) %>% st_make_grid(cellsize=grid_cellsize )
+
+a1 %>% ggplot() + geom_sf( color = "green") +
+  geom_sf(data=gj_raleigh, fill="skyblue", alpha = 0.5 ) +
+  annotation_map_tile(type="osm", progress = "none", alpha = 0.5 )  +
+  ggtitle("Bounding Box and Grid Layout over Raleigh")
+
+```
+
+Let's create row, column coordinates for all cells in the grid.
+
+```{r}
+
+# make bounding box
+
+grid_from_a1 = a1 %>% st_sf() %>% mutate( id_grid = 1:nrow(.))
+
+raleigh_bbox = st_bbox( a1 )
+
+# Calculate the number of rows and columns
+
+nCols = ceiling(( raleigh_bbox[3] - raleigh_bbox[1] ) / grid_cellsize )
+
+nRows = ceiling(( raleigh_bbox[4] - raleigh_bbox[2] ) / grid_cellsize )
+
+```
+
+The code below excludes grid cells which are dont intersect Raleigh town limits.
+
+
+```{r}
+# Define a label scheme on each grid cell.  
+#
+#
+grid_from_a1_rclab =  a1 %>% st_sf() %>% mutate(id_grid = 1:nrow(.))  %>% 
+  mutate( cols = rep(1:nCols, nRows ) ,
+          rows = unlist( lapply(1:nRows, rep, nCols) ) ) %>%
+  group_by(id_grid) %>%
+  mutate( lab = paste(rows, "-", cols,  collapse = '') ) %>%
+  dplyr::filter(id_grid %in% unlist( st_intersects(gj_raleigh, .)))  # Omit grid cells not in raleigh
+```
+
+Then we plot the included grid cells below with their labels.
+
+```{r}
+grid_from_a1_rclab %>% ggplot() + geom_sf() + 
+  geom_text( aes( label = lab, geometry = geometry), 
+             stat = "sf_coordinates" , size = 1.3) +  
+  geom_sf(data=gj_raleigh, fill="skyblue", alpha = 0.5 ) +
+  annotation_map_tile(type="osm", progress = "none", alpha = 0.5 ) 
+```
+
+
+The code below comes from the clever 
+(file:///Volumes/GDRIVE_SSD/lib/documentation/Bibliography/storage/FVQV6WIP/r-fitting-a-grid-over-a-city-map-and-inputting-data-into-grid-squares.html)
+
+
+```{r eval=FALSE}
+a2 = a1 %>% 
+     st_intersection(st_make_valid(gj_raleigh) ) %>% 
+     st_cast("MULTIPOLYGON") %>% 
+     st_sf() %>% 
+     mutate(id = row_number())
+
+```
+
+```{r eval=FALSE}
+
+a2 %>% ggplot() + geom_sf( color = "orange") +
+  geom_sf(data=gj_raleigh, fill="skyblue", alpha = 0.5 ) +
+  annotation_map_tile(type="osm", progress = "none", alpha = 0.5 ) 
+
+```
+
+
+
+## Geomapping of Assault Incidents in Raleigh
+
+
+```{r eval=TRUE}
+
+gj_assault_geocoded = st_read(paste0(data_dir, "EXP_RALEIGH_SUBSET_201801_assaults_Aug2021.geojson" ) )
+
+head(gj_assault_geocoded)
+
+```
+
+
+## Plot the assaults on the grid
+
+The chart below shows the city of Raleigh overlaid by a uniform grid of squares, each of size $N \times N$ where $N=$ `r grid_cellsize` feet.  The cells intersecting the city territory are displayed.   Assault incidents for the month of Jan 2018 are displayed as red dots at their locations within the city.
+
+
+```{r}
+grid_from_a1_rclab %>% ggplot() + geom_sf(size=0.5) + 
+  geom_text( aes( label = lab, geometry = geometry), 
+             stat = "sf_coordinates" , size = 1.3) +  
+  geom_sf(data=gj_assault_geocoded, color = "red", size = 0.3) +
+  geom_sf(data=gj_raleigh, fill="skyblue", alpha = 0.5 ) +
+  annotation_map_tile(type="osm", progress = "none", alpha = 0.5 ) 
+
+
+
+```
+
+## Joining Grid Cells with Crime Data
+
+We start by using a much smaller subset of 10 crime incidents on Wake Forest Road to test the output.
+
+```{r}
+gj_assault_wake_forest = gj_assault_geocoded  %>% 
+  filter( str_detect(reported_block_address, "WAKE FOREST RD" ) ) %>% 
+  arrange(reported_block_address)
+
+gj_assault_wake_forest %>% dplyr::select(reported_block_address, OBJECTID, district, reported_date)
+
+```
+
+The first join of CRIMES to CELLS yields 10 rows.  All CRIMES belong to some CELL.
+
+```{r}
+gj_assault_wake_forest %>% st_join( grid_from_a1_rclab) %>% dplyr::select(OBJECTID, reported_block_address, reported_date, lab, id_grid)
+
+```
+
+
+The second join of CELLS to CRIMES yields 254 rows.  
+Most CELLS have no CRIMES associated.   The rows represent the 10 incidents which occur in 3 grid cells.
+All other 244 cells have one row with NA value for the OBJECTID which is a column of the incident dataframe.
+
+
+```{r}
+cells_to_crimes = grid_from_a1_rclab %>% st_join( gj_assault_wake_forest) %>% 
+  dplyr::select(OBJECTID, reported_block_address, reported_date, lab, id_grid)
+
+dim(cells_to_crimes)
+
+```
+
+We can count the number of crime incidents in each cell with the following commands.  Note that we truncate the results to just the first 10 rows for brevity.  The same code can work for any grid resolution of Raleigh.
+
+```{r}
+
+grid_from_a1_rclab %>% st_join(gj_assault_wake_forest) %>% group_by(id_grid, lab) %>% 
+  summarize( ct = sum( !is.na(OBJECTID))) %>% 
+  st_drop_geometry() %>% arrange(desc(ct)) %>% head(n=10) %>% 
+  kable() %>% kable_styling(bootstrap_options = c("hover", "striped"))
+
+```
+
+```{r}
+
+cell_results = grid_from_a1_rclab %>% st_join(gj_assault_geocoded) %>% group_by(id_grid, lab) %>% 
+  summarize( ct = sum( !is.na(OBJECTID))) %>% 
+  st_drop_geometry() %>% arrange(desc(ct)) 
+
+cell_results %>%  kable() %>% kable_styling(bootstrap_options = c("hover", "striped"))
+
+```
+
+## Bounding Box of a Few Crimes
+
+In this section, we experiment with building a grid pattern around  a single crime incident.
+We want to experiment with two objectives:
+
+-  Building a bounding box and a small grid pattern with a known number of point incidents.
+
+-  Partition the bounding box into a 4 by 4 grid.
+
+-  Compute a kernel density of the points in the bounding box where each grid cell is a pixel.
+
+-  Extract the numerical density of each grid cell and verify it is approximately equal to 
+   the number of points in each grid cell divided by area of the cell in reference units.
+   
+Successful implementation of this experiment allows us to work with larger scale bounding boxes and kernel density of more complex boundary regions.
+
+```{r echo=TRUE}
+
+buffer_radius = 4000
+
+# define the center of the bounding box as a single crime incident.
+(incident1 = gj_assault_wake_forest %>% filter( OBJECTID == 124406) )
+
+# define the window around the point of a given radius in feet.
+w_incident1 = st_sfc( st_geometry( incident1 ) ) %>% st_buffer( buffer_radius )
+
+# define a bounding box around the circle centered at incident1
+(bb_incident1 = st_as_sfc( st_bbox(w_incident1) ) )
+
+# Grab the points inside the bounding box centered at incident1
+incidents_in_bb = st_intersection(gj_assault_geocoded, bb_incident1)
+
+plt1 = incidents_in_bb  %>% ggplot() + geom_sf(alpha = 0.7 , color = "blue") +
+       geom_sf( data = bb_incident1, alpha = 0.3, color = "red") +
+       annotation_map_tile(type="osm", progress = "none", alpha = 0.4 )  +
+       fixed_plot_aspect(ratio = 1) + ggtitle(paste0("Bounding Box ", buffer_radius , " feet and assaults") )
+
+plt2 = gj_assault_geocoded %>% ggplot() + geom_sf( alpha = 0.5 ) + geom_sf( data = bb_incident1, 
+                                                        alpha = 0.5 , 
+                                                        color = "red" ) + 
+  ggtitle("bigger perspective of bbox")
+
+
+plot_grid(plt1, plt2)
+```
+
+
+```{r}
+bb_incident1_grid = bb_incident1 %>% st_make_grid(cellsize = buffer_radius / 3  )
+
+```
+
+```{r}
+# Define a label scheme on each grid cell.  
+# Assume we have a 4x4 grid pattern - based on square having 2 x buffer_radius
+# and grid cells is 0.5 * buffer_radius
+# -----------------------------------------------------------------
+
+nRows = 6
+nCols = 6
+bb_incident1_grid_rclab =  bb_incident1_grid %>% st_sf() %>% mutate(id_grid = 1:nrow(.))  %>% 
+  mutate( cols = rep(LETTERS[1:nCols], nRows ) ,
+          rows = unlist( lapply(1:nRows, rep, nCols) ) ) %>%
+  group_by(id_grid) %>%
+  mutate( lab = paste(rows, "-", cols,  collapse = '') ) 
+```
+
+```{r}
+bb_incident1_grid_rclab  %>% ggplot() + geom_sf(size=0.5) + 
+  geom_text( aes( label = lab, geometry = geometry), 
+             stat = "sf_coordinates" , size = 1.3) +  
+  geom_sf(data=incidents_in_bb, color = "red", size = 0.3) +
+  geom_sf(data=gj_raleigh, fill="skyblue", alpha = 0.5 ) +
+  annotation_map_tile(type="osm", progress = "none", alpha = 0.5 ) +
+  labs( title = "Mini-Grid in city context")
+
+
+```
+
+
+```{r}
+bb_incident1_grid_rclab  %>% ggplot() + geom_sf(size=0.5) + 
+  geom_text( aes( label = paste0(lab, "/", id_grid ) , geometry = geometry), 
+             stat = "sf_coordinates" , size = 3) +  
+  geom_sf(data=incidents_in_bb, color = "blue", size = 2) +
+  annotation_map_tile(type="osm", progress = "none", alpha = 0.5 ) +
+  labs( title = "Mini-Grid and its incidents")
+
+```
+
+Now let's define the spatstat ppp object so we can compute the kernel density.  There are several ingredients needed to build the density:
+
+-   The points data in `sf` format.  `incidents_in_bb`
+-   The window surrounding the points data `bb_incident1`
+-   The grid cell width  `buffer_radius` / 2.
+-   Run the density.ppp function with points, window, grid cell width, kernel type.
+-   Convert the density raster to a stars object using `st_as_stars`
+
+```{r}
+# creates a point pattern object in spatstat from sf objects.
+
+( ppp_incidents_in_bb = c( bb_incident1, st_geometry(incidents_in_bb) ) %>% as.ppp() )
+
+
+
+```
+Count the number of incidents.
+
+```{r}
+q1 = quadratcount(ppp_incidents_in_bb, nx = 6, ny = 6)
+
+plot(q1, main = "")
+plot(incidents_in_bb, add = TRUE , col = "red" )
+
+
+
+```
+
+The density kernel function call details:
+
+`dimyx` is an argument passed to `as.mask`.  `dimyx` is vector of length 2 where $dimyx[1] = m$ is the number of pixels in the y direction.  $dimyx[2]=n$ is the number of pixels in the x-direction.
+This is consistent with a matrix dimensionality convention but contrary to cartesian coordinates.
+
+An alternative is to use `eps` to define the grid spacing in the units of the reference system.
+
+```{r}
+
+den_incidents = density.ppp(ppp_incidents_in_bb, sigma = 400, kernel = "gaussian", dimyx = c(6 , 6) )
+
+plot(den_incidents)
+
+```
+```{r}
+( s1 = st_as_stars(den_incidents) )
+
+```
+
+## Grabbing Crime Incidents Near Raleigh Border
+
+Some crime incidents in Raleigh are geocoded to locations near but outside the town corporate limits.
+They show up as being excluded from the count because they fall outside the polygon.  This was manually crosschecked using the Wake County ARC GIS system.
+
+A suitable solution is to extend the polygons of each segment of Raleigh by 30 feet to ensure that crime incidents geocoded to the middle of a street bordering the town boundary are included.
+
+```{r}
+
+gj_raleigh_buffer = st_buffer(gj_raleigh, dist = 100 ) %>% st_union() %>% st_sf() %>% mutate( id_buffer = 1:nrow(.))
+
+gj_raleigh_buffer %>% ggplot() + geom_sf( fill = "skyblue", color = "darkred") + 
+  labs(title = "Raleigh City:  Buffered, Alpha Blending") +
+  annotation_map_tile(type="osm", progress = "none", alpha = 0.5 ) 
+```
+
+
+
+```{r make_buffered_grid}
+a1buffer = st_make_valid(gj_raleigh_buffer) %>% st_make_grid(cellsize=grid_cellsize )
+
+a1buffer %>% ggplot() + geom_sf( color = "green") +
+  geom_sf(data=gj_raleigh_buffer, fill="skyblue", alpha = 0.5 ) +
+  annotation_map_tile(type="osm", progress = "none", alpha = 0.5 ) 
+
+
+
+
+# make bounding box
+
+grid_from_a1buffer = a1buffer %>% st_sf() %>% mutate( id_grid = 1:nrow(.))
+
+raleigh_buff_bbox = st_bbox( a1buffer )
+
+# Calculate the number of rows and columns
+
+nColsBuff = ceiling(( raleigh_buff_bbox[3] - raleigh_buff_bbox[1] ) / grid_cellsize )
+
+nRowsBuff = ceiling(( raleigh_buff_bbox[4] - raleigh_buff_bbox[2] ) / grid_cellsize )
+
+```
+
+Define the grid of cells over a buffered Raleigh.
+
+```{r buffered_label_scheme}
+# Define a label scheme on each grid cell.  
+#
+#
+grid_from_a1buffer_rclab =  a1buffer %>% st_sf() %>% mutate(id_grid = 1:nrow(.))  %>% 
+  mutate( cols = rep(1:nColsBuff, nRowsBuff ) ,
+          rows = unlist( lapply(1:nRowsBuff, rep, nColsBuff) ) ) %>%
+  group_by(id_grid) %>%
+  mutate( lab = paste(rows, "-", cols,  collapse = '') ) %>%
+  dplyr::filter(id_grid %in% unlist( st_intersects(gj_raleigh_buffer, .)))
+
+```
+
+Then join the grid of cells to the crime incidents and see which incidents are not mapped to a grid cell.
+
+
+
+```{r eval=TRUE}
+
+gj_assault_hist = st_read(paste0(data_dir, "EXP_EDA_RALEIGH_assaults_Aug2021.geojson" ) )
+
+head(gj_assault_hist)
+
+```
+
+
+```{r}
+gj_assault_hist %>% st_join(grid_from_a1buffer_rclab) %>% 
+  dplyr::select(OBJECTID, reported_block_address, reported_date, id_grid) %>%
+  st_drop_geometry() %>%
+  filter(is.na(id_grid)) %>% 
+  group_by(reported_block_address) %>% 
+  summarize( ct = n())
+
+```

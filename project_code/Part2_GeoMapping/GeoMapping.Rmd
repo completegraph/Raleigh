@@ -1,0 +1,318 @@
+---
+title: "Geomapping"
+author: "Alexander Ng"
+date: "10/14/2021"
+output: 
+  html_document:
+    df_print: paged
+    highlight: tango
+    number_sections: yes
+    theme: readable
+    toc: yes
+    toc_depth: 2
+    toc_float: no
+    fontsize: 12
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(kableExtra)
+library(sf)
+library(ggspatial)
+
+```
+# Loading the Map Data Files
+
+```{r define-dirs}
+proj_dir = "/Volumes/GDRIVE_SSD/homes/alex/datascience/698_CAPSTONE_2021_FALL"
+
+working_dir = paste0(proj_dir, "/", "project_code/Part2_GeoMapping/")
+
+data_dir = paste0(proj_dir, "/project_data/")
+
+setwd(working_dir)
+
+```
+
+```{r map-file-load}
+raleigh_corporate_limits_file = paste0(data_dir, "Corporate_Limits.geojson")
+
+cityworks_potholes_file = paste0(data_dir, "Cityworks_Potholes.geojson" )
+
+raleigh_parks_file = paste0(data_dir, "Raleigh_Parks.geojson")
+```
+
+```{r load-potholes}
+gj_potholes = sf::st_read(cityworks_potholes_file, quiet = TRUE ) %>% st_transform(2264)
+
+```
+
+
+```{r load-parks}
+gj_parks = sf::st_read(raleigh_parks_file, quiet = TRUE ) %>% st_transform(2264)
+
+```
+
+
+```{r load-raleigh-boundary}
+#
+# Load the geojson files
+# change the coordinate system to 2264
+# filter objects that belong to RALEIGHT
+# --------------------------------------------
+gj_raleigh <- sf::st_read(raleigh_corporate_limits_file, quiet = TRUE) %>% 
+  st_transform(2264) %>% 
+  filter( SHORT_NAME == 'RAL' )
+
+head(gj_raleigh) %>% select(-ORDINANCE_NUMBER, -EFFECTIVE_DATE, -SHAPEAREA ) %>% st_drop_geometry() %>%
+  kable() %>% kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+We compute the area of the polygonal representation and validate by checking against Wikipedia's reported area.
+They are very close.
+
+```{r}
+# Compute the total square miles of the polygons.
+# The NAD83 North Carolina projection uses square ft.
+# ------------------------------------------------------
+area_of_polygons = st_area(gj_raleigh)
+
+sprintf( "Raleigh Area is: %.2f square miles.  Wikipedia gives: 147.64 sq mi" , sum(area_of_polygons) / ( 5280^2)  )
+
+```
+
+The square mile area for most areas look accurate.  However, note that they show area inside
+Wake County.  Thus, Durham has less than 1 mile inside Wake County but actual area is over 100 squared miles.
+
+```{r}
+a = sf::st_read(raleigh_corporate_limits_file, quiet = TRUE) %>%   st_transform(2264) 
+
+a = a %>% mutate( my_area = st_area(a)) %>% mutate( sqmiles = my_area/ (5280^2)) %>% st_drop_geometry() %>%
+   select(SHORT_NAME, LONG_NAME, sqmiles) %>% group_by(SHORT_NAME, LONG_NAME) %>% summarize( sqmiles = sum( sqmiles)) 
+
+attributes( a$sqmiles ) = NULL
+
+a %>% kable(digits = 2, caption = "Square Miles of Towns inside Wake County")
+
+```
+
+# Visualization with GGPLOT and related libraries
+
+## Plotting the City and Base Layer
+
+ggplot and geom_sf with no other arguments.
+
+```{r}
+gj_raleigh %>% ggplot() + geom_sf() + labs(title = "Raleigh - Plain Map")
+```
+
+
+Fill the interior with color and add a border in red.
+
+```{r}
+gj_raleigh %>% ggplot() + geom_sf( fill = "skyblue", color = "darkred", size = 0.1) + 
+  labs(title = "Raleigh City Limits in Color")
+```
+
+Let's put a basemap tile underneath and  compass rose and alpha blend.
+
+```{r}
+gj_raleigh %>% ggplot() + geom_sf( fill = "skyblue", color = "darkred") + 
+  labs(title = "Raleigh City:  Basemap , Compass, Alpha Blending") +
+  annotation_map_tile(type="osm", progress = "none", alpha = 0.5 ) +
+  annotation_north_arrow(location="bl", which_north = "true")
+```
+
+## Plotting Point Data and Cities As Layers
+
+Here is a plot of all potholes in Raleigh Cityworks database.
+
+```{r}
+gj_raleigh %>% ggplot() + geom_sf( fill = "skyblue", color = "darkred") + 
+  labs(title = "Raleigh City: Basemap, Boundary and Potholes") +
+  geom_sf(data=gj_potholes, color = "yellow" , size = 0.1 ) +
+  annotation_map_tile(type="osm", progress = "none", alpha = 0.5 )
+```
+
+## Mapping Parks and Cities as Layers
+
+
+Here is a plot of all city parks in Raleigh database.
+
+```{r out.width="100%"}
+gj_raleigh %>% ggplot() + geom_sf( fill = "skyblue", color = "darkred") + 
+  labs(title = "Raleigh City: Basemap, Boundary and Parks") +
+  geom_sf(data=gj_parks, color = "darkgreen" , fill = "darkgreen") +
+  annotation_map_tile(type="osm", progress = "none", alpha = 0.5 )
+```
+
+It appears that Forest Ridge Park (in North Raleigh) and Lake Wheeler Park (South Raleigh) are outside of 
+City limits.   Lake Wheeler is a large reservoir (650 acres water and 150 acres park).  It is the primary water supply for Raleigh.  It may be desirable to drop these two large parks since they fall outside the town limits.
+
+
+```{r}
+gj_parks %>% select( NAME, PARK_TYPE, CAC, MAP_ACRES) %>% 
+  st_drop_geometry() %>% arrange(desc(MAP_ACRES)) %>%
+  kable(caption="Parks in Raleigh by Area", digits = 1 ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+
+```
+
+## Geomapping of Assault Incidents in Raleigh
+
+
+```{r}
+
+gj_assault_geocoded = st_read(paste0(data_dir, "EXP_EDA_RALEIGH_assaults_Aug2021.geojson" ) )
+
+head(gj_assault_geocoded)
+```
+
+```{r}
+
+
+gj_raleigh %>% ggplot() + geom_sf( fill = "skyblue", color = "darkred") + 
+  labs(title = "Raleigh City: Basemap, Boundary and Crime") +
+  geom_sf(data=gj_assault_geocoded, color = "yellow" , size = 0.1 ) +
+  annotation_map_tile(type="osm", progress = "none", alpha = 0.5 )
+```
+
+## Crime Density Maps by Year
+
+
+### Crime in 2014
+
+This was a partial year
+```{r}
+
+gj_raleigh %>% ggplot() + geom_sf( fill = "skyblue", color = "darkred") + 
+  labs(title = "Raleigh City: Crime Map 2014") +
+  layer_spatial(data=gj_assault_geocoded %>% filter(reported_year==2014), color = "yellow" , size = 0.1 ) +
+  annotation_map_tile(type="osm", progress = "none", alpha = 0.5 ) 
+
+
+```
+
+
+### Crime in 2015
+
+This was a full year
+```{r}
+this_year = 2015
+
+gj_raleigh %>% ggplot() + geom_sf( fill = "skyblue", color = "darkred") + 
+  labs(title = paste0("Raleigh City: Crime Map ", this_year ) ) +
+  layer_spatial(data=gj_assault_geocoded %>% filter(reported_year==this_year), color = "yellow" , size = 0.1 ) +
+  annotation_map_tile(type="osm", progress = "none", alpha = 0.5 ) 
+
+```
+
+
+
+### Crime in 2016
+
+This was a full year
+```{r}
+this_year = 2016
+
+gj_raleigh %>% ggplot() + geom_sf( fill = "skyblue", color = "darkred") + 
+  labs(title = paste0("Raleigh City: Crime Map ", this_year ) ) +
+  layer_spatial(data=gj_assault_geocoded %>% filter(reported_year==this_year), color = "yellow" , size = 0.1 ) +
+  annotation_map_tile(type="osm", progress = "none", alpha = 0.5 ) 
+
+```
+
+
+### Crime in 2017
+
+This was a full year
+```{r}
+this_year = 2017
+
+gj_raleigh %>% ggplot() + geom_sf( fill = "skyblue", color = "darkred") + 
+  labs(title = paste0("Raleigh City: Crime Map ", this_year ) ) +
+  layer_spatial(data=gj_assault_geocoded %>% filter(reported_year==this_year), color = "yellow" , size = 0.1 ) +
+  annotation_map_tile(type="osm", progress = "none", alpha = 0.5 ) 
+
+```
+
+
+### Crime in 2018
+
+This was a full year
+```{r}
+this_year = 2018
+
+gj_raleigh %>% ggplot() + geom_sf( fill = "skyblue", color = "darkred") + 
+  labs(title = paste0("Raleigh City: Crime Map ", this_year ) ) +
+  layer_spatial(data=gj_assault_geocoded %>% filter(reported_year==this_year), color = "yellow" , size = 0.1 ) +
+  annotation_map_tile(type="osm", progress = "none", alpha = 0.5 ) 
+
+```
+
+
+### Crime in 2019
+
+This was a full year
+```{r}
+this_year = 2019
+
+gj_raleigh %>% ggplot() + geom_sf( fill = "skyblue", color = "darkred") + 
+  labs(title = paste0("Raleigh City: Crime Map ", this_year ) ) +
+  layer_spatial(data=gj_assault_geocoded %>% filter(reported_year==this_year), color = "yellow" , size = 0.1 ) +
+  annotation_map_tile(type="osm", progress = "none", alpha = 0.5 ) 
+
+```
+
+
+### Crime in 2020
+
+This was a full year
+```{r}
+this_year = 2020
+
+gj_raleigh %>% ggplot() + geom_sf( fill = "skyblue", color = "darkred") + 
+  labs(title = paste0("Raleigh City: Crime Map ", this_year ) ) +
+  layer_spatial(data=gj_assault_geocoded %>% filter(reported_year==this_year), color = "yellow" , size = 0.1 ) +
+  annotation_map_tile(type="osm", progress = "none", alpha = 0.5 ) 
+
+```
+
+
+
+### Crime in 2021
+
+This was a partial year
+```{r}
+this_year = 2021
+
+gj_raleigh %>% ggplot() + geom_sf( fill = "skyblue", color = "darkred") + 
+  labs(title = paste0("Raleigh City: Crime Map ", this_year ) ) +
+  layer_spatial(data=gj_assault_geocoded %>% filter(reported_year==this_year), color = "yellow" , size = 0.1 ) +
+  annotation_map_tile(type="osm", progress = "none", alpha = 0.5 ) 
+
+```
+
+## Kernel Density Plots
+
+The KDE code below does not work as modified.  Need to think of a better solution.
+
+```{r eval=FALSE}
+ggplot(data=gj_assault_geocoded %>% filter(reported_year==2019) ) +
+   stat_sf_coordinates() +
+    coord_equal() +
+   xlab('Longitude') + ylab('Latitude') +
+  stat_density2d(aes(fill = ..level.., x = after_stat(x), y = after_stat(y)), 
+                 alpha = 0.5 , h = 0.007, n = 500, geom = "polygon" ) +
+  scale_fill_viridis_c() +
+  annotation_map_tile(type="osm", progress = "none", alpha = 0.5 ) 
+  theme(legend.position = 'none' )
+
+
+```
+

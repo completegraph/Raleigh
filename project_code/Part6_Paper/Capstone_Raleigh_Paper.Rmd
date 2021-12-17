@@ -1,0 +1,799 @@
+---
+title: "Predicting Crime Hotspots with Cubist and Random Forests"
+author: "Alexander Ng"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output:
+  bookdown::pdf_document2:
+    toc: FALSE
+    toc_depth: '2'
+    number_sections: yes
+  bookdown::html_document2:
+    toc: yes
+    toc_depth: '2'
+    number_sections: yes
+    highlight: pygments
+  bookdown::tufte_html_book:
+    toc: yes
+    toc_depth: '2'
+    number_sections: yes
+    highlight: pygments
+  tufte::tufte_html: 
+    toc: true
+    toc_depth: '2'
+    highlight: pygments
+    number_sections: yes
+  html_document:
+    df_print: paged
+    highlight: tango
+    number_sections: yes
+    theme: readable
+    toc: yes
+    toc_depth: 0
+    toc_float: no
+    fontsize: 12
+editor_options:
+  chunk_output_type: inline
+  markdown: 
+    wrap: sentence
+fontsize: 12pt
+indent: TRUE
+params:
+  include_code: FALSE
+bibliography: included/Capstone.bib
+link-citations: true
+csl: included/apa.csl
+abstract: |
+    This study compares the accuracy of the random forest and Cubist machine learning models in hotspot prediction of assaults in Raleigh, North Carolina.  The Cubist model, previously unused in hotspot prediction, achieves comparable predictive performance by some measures (PAI, RMSE, $R^2$) with less optimal PEI, RRI and AUC.   A diagnostic coefficient boxplot for Cubist model improves interpretability and can gives insight to crime location and sign of predictor impact.  The models predict the top 25 hotspots, which comprise 0.14% of city area, account for over 7% of total assaults.   For both models, predictive accuracy declined in 2020 possibly due to the Covid-19 pandemic and social unrest.   Interactive maps of the grid hotspots can provide further insight for policing.
+    
+    **Keywords:** crime prediction, Cubist, random forest, hotspot analysis, Raleigh
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+```{=latex}
+% Trigger ToC creation in LaTeX
+
+\renewcommand{\baselinestretch}{0.7}\normalsize
+\tableofcontents
+\renewcommand{\baselinestretch}{1.0}\normalsize
+```
+```{r dirs, echo = FALSE}
+
+proj_dir = "/Volumes/GDRIVE_SSD/homes/alex/datascience/698_CAPSTONE_2021_FALL"
+data_dir = paste0(proj_dir, "/project_data/")
+working_dir = paste0(proj_dir, "/project_code/Part6_Paper/")
+included_dir = paste0(working_dir, "included/")
+
+setwd(working_dir)
+
+```
+
+```{r message=FALSE, warning=FALSE}
+suppressPackageStartupMessages(library(knitr) )
+suppressPackageStartupMessages( library(tidyverse) )
+suppressPackageStartupMessages(library(kableExtra) )
+suppressPackageStartupMessages(library(sf))
+suppressPackageStartupMessages(library(caret))
+
+library(ggspatial)
+library(cowplot)
+library(Cubist)
+library(ranger)
+library(cowplot)
+library(skimr)
+library(viridis)
+library(RColorBrewer)
+library(caret)
+library(corrplot)
+library(caret)
+library(rpart)
+library(party)
+library(readxl) # to parse Excel workbooks
+library(openxlsx) # for writing xlsx files
+library(bookdown)
+library(Rcpp)
+library(magick)
+
+```
+
+```{css, echo=FALSE}
+.code-bg {
+  background-color: lightgray;
+}
+```
+
+# Introduction
+
+Crime analysis has made extensive and growing use of quantitative methods machine learning (ML) techniques over the last two decades [@Santos2017-iu; @kounadiSystematicReviewSpatial2020].
+One area of application is crime hotspot identification.
+A *crime hotspot* may be defined as "an area that has a greater than average number of criminal or disorder events, or an area where people have a higher than average risk of victimization." [@eckMappingCrimeUnderstanding2005]
+
+The objective of this research is to predict crime hotspots in urban areas using machine learning methods.
+This paper contributes to the crime hotspot prediction literature by analyzing hotspot prediction in Raleigh, North Carolina, a city not previously used.
+It also applies the Cubist model to produces PAI and hotspot predictions comparable to the more commonly used random forest model.
+Diagnostic plots for Cubist model can further improve model interpretability.
+
+# Literature Review
+
+We review the crime hotspot prediction literature and then the machine learning models.
+There is a large and growing literature on crime prediction using machine learning methods.
+@kounadiSystematicReviewSpatial2020 finds over 786 paper written over 18 years with research activity in this field following a rapidly growing trend.
+The top 4 ML methods used in their survey are random forests, multilayer perceptron, kernel density estimation and support vector machines.
+
+A central tenet in the study of crime prediction is that crime rates are not uniformly distributed in an urban setting [@bragaEffectsHotSpots2014; @drawveMetricComparisonPredictive2016; @chaineyUtilityHotspotMapping2008; @eckMappingCrimeUnderstanding2005; @wheeler_mapping_2020].
+Hotspot mapping is currently used by a majority of US police departments with the idea that targeting small high crime areas may optimize limited resources [@bragaEffectsHotSpots2014].
+Hotspot analysis also finds application in urban development planning, community awareness and real estate [@eckMappingCrimeUnderstanding2005].
+
+@eckMappingCrimeUnderstanding2005 points out hotspot mapping is most effective when used together with a theory of crime.
+Following that approach, this project is closely aligned with neighborhood theories of crime such as the *routine activities* theory.
+This theory posits that crime occurs because people follow routine activities.
+For example, motor vehicle thefts occur because people leave their personal valuables in their cars when working out at the gym [@Santos2017-iu].
+Regardless of the theory, @bragaEffectsHotSpots2014 finds that hotspot mapping has been effective in reducing crime rates in a meta-analysis of 19 case studies.
+
+To compute hotspots, one way is to count crime incidents in an areal unit (which may be defined by administrative boundaries, e.g. police precinct, county, residential subdivision) or by grid-based cell units.
+A more sophisticated way is to use kernel density estimation which bandwidth estimation.
+[@eckMappingCrimeUnderstanding2005]
+
+If hotspot prediction is viewed as a classification problem, there is a large class imbalance because most areas of a city are not hotspots.
+Crime researchers have made advances in defining specialized performance metrics like the Performance Accuracy Index (PAI) [@chaineyUtilityHotspotMapping2008], Predictive Efficiency Index (PEI) or Recapture Rate Index (RRI) [@levineHottestPartHotspot2008].
+PAI was introduced in 2008 to assess the utility of hotspot mapping for crime prediction.
+It overcomes the limitation of the earlier used *hit rate* which does not consider the size of the area where crimes are predicted [@chaineyUtilityHotspotMapping2008].
+It is defined as:
+
+$$
+PAI = \frac{ \frac{n}{N} }{ \frac{a}{A}} = \frac{\text{Hit Rate}}{\text{Area Percentage}}
+$$
+
+where $n$ is number of crimes and $a$ is the area in the predicted hotspots and $N$ is the number of crimes and $A$ is the area of entire study area.
+@chaineyUtilityHotspotMapping2008 implicitly assumes the study area is overlay with a uniform grid of square cells of size $N \times N$ meters.
+
+@drawveResearchNoteMethodological2019 notes that PAI is subject to a number of potential issues.
+In particular, the comparability of PAI across different studies is challenging due to the selection criteria of in-scope area for inclusion in the denominator.
+For example, including areas with no crime can inflate to the PAI metric.
+In section \@ref(s-assessing-accuracy), we recast the above metrics in an equivalent common mathematical form.
+
+Random forests have been widely used in crime hotspot prediction studies in the last decade.
+Some of the relevant studies that apply random forests are identified here.
+@mohlerRotationalGridPAI2018 analyzes crime using random forests.
+Their predictors are limited to prior crime incident counts in the city of Portland, OR. An important innovation is to optimize for predictive accuracy by allowing the rotational angle and size of the grid drawn over the city to vary.
+This algorithm won an open 2017 U.S.Department of Justice crime forecasting competition.
+They used grid cell squares of at least 125 feet in their study.
+They used PAI as the performance metric.
+
+@wheeler_mapping_2020 also find random forests outperform risk terrain models in crime prediction in the city of Dallas, TX. They divide Dallas into over 217,000 grid cell squares of size 200 feet and use PAI, PEI and RRI and AUC as performance metrics.
+
+@yaoPredictionCrimeHotspots2020 apply random forests to analyze crime in San Francisco using historical crime incident data alone in comparison with additional predictors like POI and demographic data.
+They predict a low to high frequency of hotspot occurrence.
+Their grid cell size is 200 meters.
+They show improved model performance using a log-loss function.
+
+@zhangComparisonMachineLearning2020 uses a grid cell based approach in an unspecified coastal city in southern China.
+They apply multiple ML methods including random forests, KNN, SVM, naive Bayes, CNN and LSTM.
+They find that LSTM (long-term, short-term neural nets) outperformed other techniques.
+They used POI and road networks to define kernel density estimates used as predictors for crime rates.
+Their grid cell size is 150 meters over an area of 6.5 square kilometers.
+They use a hit rate metric similar to PAI for model assessment.
+
+@cichoszUrbanCrimeRisk2020 studies the UK districts of Manchester, Liverpool, Bournemouth and Wakefield using multiple crime types and machine learning techniques.
+He finds that RF models produce the "best predictive performance regardless of the urban area and crime type" [@cichoszUrbanCrimeRisk2020].
+
+Most crime hotspot prediction studies appear to focus on metropolitan areas.
+There are fewer studies of mid-sized cities such as Raleigh, North Carolina.
+For example, of the 32 papers selected for @kounadiSystematicReviewSpatial2020, only 6 papers analyzed mid-sized cities, i.e. with population between 100,000-500,000.
+These were Richmond, VA, Little Rock, AK, Arlington, TX, Baton Rouge, LA, Tippecanoe, IN and one paper @rummensComparisonNearRepeatMachine2020 which analyzed an unspecified Belgian city of over 250,000 inhabitants.
+Yet, over a quarter of the US population live in cities with populations between 50,000-500,000 according to @raetzHousingCharacteristicsSmall2021.
+
+The use of points of interest (POI) data as predictors of crime is well-established.
+@cichoszUrbanCrimeRisk2020 uses Points of Interest (POI) data from OpenStreetMap to derive attributes for micro-areas as predictors for crime hotspot prediction.
+Points of Interest (POI) include bus stops, mail boxes, bus stops, waste baskets and taxi stands as well as stores, schools and parks.
+Both POI and prior crime counts are predictors in his analysis.
+@wheeler_mapping_2020 uses census demographic data and geographic crime generators like bars, hotels, gas stations, stores and rail stations on a fixed grid.
+@drawveMetricComparisonPredictive2016 studies robberies in Little Rock, Arkansas using pawn shops, check-cashing stores, tattoo parlors, restaurants and grocery stores and other locations as POI.
+
+We also use pothole locations as a predictor of crime hotspots.
+Functionally, they are like POIs except that they are transient.
+Prior work by @wheelerEffect311Calls2018 on potholes in the context of 311 service calls suggests potholes have a modest impact on crime rates.
+
+Of the two machine learning algorithms compared in this study, random forests are much more extensively studied and used.
+The formal statistical study and description of the properties of the random forest model is available from its author, Leo Breiman @breimanRandomForests2001.
+In contrast, no comparable formal description of the Cubist model, previously a proprietary commercial software application, has been published by its inventor, Ross Quinlan.
+Relevant papers like @quinlanLearningContinousClasses1992 describe predecessors of the Cubist model like M5 tree model.
+Its `C` source code was released by its inventor in 2011 and subsequently ported to `R` in 2012 by Max Kuhn and others.
+Both models are described by @kuhnAppliedPredictiveModeling2013.
+
+Based on OneSearch, survey papers [@kounadiSystematicReviewSpatial2020; @buttSpatioTemporalCrimeHotSpot2020] and related searches, the Cubist model has not previously been used in spatial crime prediction.
+Likewise, no prior machine learning spatial crime academic study has evaluated Raleigh, North Carolina.
+A literature keyword search in CUNY OneSearch confirms that `random forest` and `crime` are well represented with 203 entries in the topic of `Crime` with no matches using `Cubist` and `crime`.
+A similar search for `Raleigh`, `crime`, `prediction` found 46 matches in the topic of `Crime` but no article involving machine learning.
+
+# Data
+
+The city of Raleigh is a mid-sized city of 146 square miles and a 2020 population of 467,665.
+Raleigh is also the state capitol of North Carolina, USA, and has an additional concentration of government and historic points of interest.
+([www.visitraleigh.com](www.visitraleigh.com))
+
+The types of data used for this study include:
+
+-   Map of city boundaries
+-   Historical crime incident data for the City of Raleigh with geocoding
+-   Census demographic data on unemployment, household income, poverty and population density from the ACS 2019 survey
+-   Points of interest such as retail stores, restaurants and bars
+-   Pothole locations by City of Raleigh
+
+All data sources are public and downloadable.
+The City of Raleigh Open Data portal (<https://data-ral.opendata.arcgis.com>) provided the City boundaries, historical crime incident data from the Raleigh Police Department and Potholes workorder data in `geojson` file format.
+
+## Points of Interest
+
+Points of interest data refers to a wide range of locations: retail stores, schools, restaurants, bars, fields, parks, etc.
+These are sourced from the OpenStreetMap (OSM) project as Shape files.
+Some POI data is encoded as points and others as areas (multi-polyons).
+We download the North Carolina POI data files from a related website geofabrik.de on their North America/United States page at <http://download.geofabrik.de/north-america/us.html>.
+The files of interest are `gis_osm_pois_free_1.shp` and `gis_osm_pois_a_free_1.shp`.
+We use 37 types of POI in the study.
+
+## Demographic Data
+
+Demographic data were downloaded from <https://censusreporter.org> and sourced from the US Census Bureau ACS 2019 survey at the block group level.
+We verified that the demographic data covered all of Raleigh by using the Raleigh-Durham-Cary, NC Combined Statistical Area (CSA).
+Four demographic variables were examined:
+
+-   Poverty (table B17017) Poverty rate is expressed as proportion of households below poverty in the last 12 months in each block group.
+-   Unemployment Status for the Population 16 years and over (table B23025), nemployment rate is expressed as proportion of unemployed over total population 16 years and over.
+-   Median Household Income (table B19013), Median household income is expressed in 2019-inflation adjusted dollars.
+-   Population (table B01003). Density was expressed as number of people per square mile in each block group.
+
+## Potholes
+
+Potholes are an additional source of point data provided by the City.
+Each pothole file observation represents a workorder with a geolocation and initiation date.
+To avoid model bias, we only use potholes with initiation date before Jan 1, 2019.
+These data don't represent all potholes but those fixed by the City.
+We use 721 potholes in the study.
+
+## Crime Incidents
+
+The Raleigh Policy Department publishes a daily historical data set of crime incidents since June 2014.
+The dataset conforms to the National Incident-Based Reporting System (NIBRS) requirements.
+We use incidents where `crime_category` equals `ASSAULT` and where geocoding is provided inside or no farther than 100 feet of city limits.
+Incidents from Jan 1, 2016 to Dec 31, 2020 were used in the study.
+
+The data quality of assaults was evaluated for potential issues.
+A fraction of crime incidents are not geocoded.
+The percentage of geocoded events by year appears stable as shown in Table \@ref(tab:geocoding-fraction).
+
+```{r}
+df_geocoded_assaults = tibble( year = c(2014, 2015, 2016, 2017, 2018, 2019, 2020, 2021),
+                               assaults = c( 95.3, 94.8, 94.2, 94.2, 95.7, 96.1, 96.2 , 95.9 )
+                               ) %>% pivot_wider(names_from = "year", values_from = "assaults") %>% add_column(Year = c("Assaults %Geocoded")) %>% relocate(Year)
+```
+
+```{r geocoding-fraction}
+df_geocoded_assaults %>% 
+  kable(caption= "Percentage Geocoded Assaults 2014-2021") %>% 
+  kable_styling(bootstrap_options = c("hover", "striped"))
+
+```
+
+A rule of thumb in the crime prediction literature is that 95% geocoding is an acceptable data quality threshold.
+[@chaineyUtilityHotspotMapping2008].
+As this dataset is close to the 95% target, we omit assaults with no geocoding.
+
+A second issue, as discussed earlier, is that some incidents were geocoded near but outside the Raleigh city limit.
+For example, an assault was geocoded in the middle of a street while the boundary ends at the sidewalk of the street.
+We expand the city limit by 100 feet to include these incidents.
+This expanded the city area by 5 square miles but captured nearly all incidents.
+
+```{r crime-periods}
+df_crime_periods = tibble( Variable = c("Period Assaults", "crime_freq", "crime_freq_6M", "crime_freq_1Y", "crime_freq_2Y", "crime_freq_3Y") ,
+                           VarType = c("Count", "Response", "Predictor", "Predictor", "Predictor", "Predictor") ,
+                           `Period 2018` = c("6037", "Jan 1 -Dec 31, 18", "July 1-Dec 31, 17", "Jan 1-June 30, 17", "Jan 1-Dec 31, 16", "Jan 1-Dec 31, 15"),
+                           `Period 2019` = c("6289", "Jan 1 -Dec 31, 19", "July 1-Dec 31, 18", "Jan 1-June 30, 18", "Jan 1-Dec 31, 17", "Jan 1-Dec 31, 16"),
+                           `Period 2020` = c("5659", "Jan 1 -Dec 31, 20", "July 1-Dec 31, 19", "Jan 1-June 30, 19", "Jan 1-Dec 31, 18", "Jan 1-Dec 31, 17")
+                           )
+df_crime_periods %>% kable(caption = "Crime Predictor Data Periods") %>% 
+  kable_styling(bootstrap_options = c("hover", "striped"))
+
+```
+
+All crime frequencies are stated to an annualized rate for consistency.
+
+## Grid Definition
+
+We define a grid of squares to subdivide the city of 490 feet by 490 feet.
+This dimension is roughly the length of one city block in the downtown civic center.
+While most cells of the grid were squares, if the cell intersected the boundary of the city, we define the cell as the intersection of the square and the city's interior.
+The resulting cell could have multiple disconnected components.
+
+We illustrate the grid with a lower resolution grid of squares of size 4000 feet by 4000 feet in Figure \@ref(fig:grid4000).
+
+```{r grid4000, out.width="90%" , fig.align="center", fig.cap = "Grid Construction on Raleigh with Low Resolution of 4000 ft."}
+knitr::include_graphics(paste0( included_dir, "EXP_RALEIGH_PLOT_GRID_4000.png" ))
+```
+
+Because a significant number of crimes (roughly 1%) were geocoded near but outside of city limits, we slightly expanded the city territory by 100 feet to enclose most such incidents.
+In total, Raleigh was divided into 19,782 cells.
+
+Within each grid cell $C$, we mapped each predictor to $C$ as follows:
+
+-   assault incidents occurring inside $C$ during the in-scope time period $T$ were counted.
+-   the number of points of interest (POI) inside the cell $C$ of each class `fclass` were counted.
+-   each areal points of interest (POI A) which intersects the cell $C$ is counted once in $C$.
+-   demographic variables are spatially interpolated on each cell $C$ by weighting each demographic value by its area intersecting the cell.
+-   prior period historical crimes are converted to annualized crime counts per cell.
+-   longitude and latitude of its centroid.
+
+# Methodology {#s-methodology}
+
+We construct forecasts using two different machine learning models: random forest (RF) and Cubist (CU) models.
+Both models are run trained and tested on the same datasets.
+So the methodology has three parts: specifying the datasets; defining hotspots; and defining performance metrics for model evaluation.
+
+## Predictors {#s-predictors}
+
+We divide the dataset into 3 periods for use in model fitting and index the periods by $P = 2018, 2019, 2020$.
+
+A dataset $\Phi(P) = (X(P), Y(P))$ for a period $P$ consists of a matrix $X(P)$ of dimension $N \times M$ made of $N=19782$ observations corresponding to the city grid cells with $M=48$ predictors and 1 response column vector $Y(P)$ of size $N \times 1$ representing the annualized crime rate (the column `crime_freq`).
+
+The predictors may be further grouped as:
+
+-   37 POI predictors count the number of POI located inside in a cell $C$.
+-   1 predictor representing the number of potholes.
+-   2 predictors `lon`, `lat` representing the coordinates of the centroid of each cell
+-   4 predictors for demographics
+-   4 predictors representing lagged crime rates before the test period.
+
+To use the historical crime data, we need to group the incidents both temporally and spatially.
+Table \@ref(tab:crime-periods) defines how the crime rate predictors and responses are grouped within each period $P$.
+
+A model $\mathcal{M}$ is trained on dataset $\Phi(P)$ and used to predict $Y(P+1)$ given $X(P+1)$ as input.
+Taking the Period 2018 set as an example.
+The models are trained on Period 2018 data and tested on Period 2019.
+In the Period 2018 dataset, `crime_freq` (the response) is the annualized frequency of assaults for incidents in the period Jan 1 - Dec 31, 2018.
+The four predictors `crime_freq_6M`, `crime_freq_1Y`, `crime_freq_2Y`, `crime_freq_3Y` are associated with the periods before Dec 31, 2017.
+Then the model was tested on the Period 2019 dataset to predict `crime_freq` for Jan 1 - Dec 31, 2019 at each cell.
+
+We then repeat this procedure by training $\mathcal{M}$ on Period 2019 and testing on Period 2020.
+
+Forecast accuracy is a challenge because of significant class imbalance between hotspots and non-hotspots.
+We discuss this subject further in section \@ref(s-assessing-accuracy).
+
+## Defining Hotspots
+
+The hotspot prediction methodology produces a predicted crime rate $f(C)$ at each cell $C$ of the city grid $G$ representing the annualized rate of assaults in cell $C$.
+The $N$ forecasts are ranked descending order by $f(C)$.
+For some user specified threshold $1 \leq \lambda \leq N$, the top $\lambda$ cells are designated to be *hotspots*.
+In this study we designate $\lambda = 100$ so the top 100 cells with the most predicted assaults are hotspots in a test period.
+
+## Assessing Accuracy {#s-assessing-accuracy}
+
+Forecasting hotspots on an urban crime grid suffers from significant class imbalance.
+For example, in 2020, 87.6% of the cells had no assaults.
+6.91% has 1 assault.
+Only 1.94% of cells has 4 or more assaults.
+A naive model that always predicts zero assaults would be 87.6% accurate.
+While some hotspot measures penalize the size of the prediction error at hotspots, others emphasize identifying location of hotspots.
+Policing decisions may emphasize the allocation of resources to hotspot locations rather than the exact numerical prediction.
+
+Four crime-prediction specific measures are calculated in this study.
+
+Let $g(C)$ denote the realized crime rate in cell $C$ during the prediction period of interest.
+Let us assume that a machine learning model $f$ predicts the crime rate in the cells $C_i$ of urban grid $G$.
+We order the cells as $C_1, C_2, \ldots , C_{N}$ such that $f(C_i) \geq f(C_{i+1}), \forall i, 1 \leq i < N$.
+Let $A(r)$ represent the region comprised of $C_1 \cup \ldots C_{r}$ and let $\mu(C_i)$ be the area of the cell $C_i$.
+
+*Predictive Accuracy Index* (PAI) introduced by @chaineyUtilityHotspotMapping2008 is:
+
+$$PAI(A(r)) = \frac{\sum_{i=1}^{r} f(C_i) }{\sum_{C \in G} f(C) }\frac{\mu(G)}{\sum_{i=1}^{r}\mu(C_i)}$$ PAI measures the ratio of the crime rate in a set of hotspots over the crime rate over the entire city.
+A PAI value greater than 1 suggest the forecast is effective in identifying hotspots.
+
+*Predictive Efficiency Index* (PEI) measures the ratio of the observed $PAI$ versus the best possible $PAI$ if the model had perfect foresight of the realized crime rate.
+Let $A^{*}(r) = C_{\sigma(1)} \cup C_{\sigma(2)} \ldots \cup C_{\sigma(N)}$ be the region of the $r$ cells with the highest realized crime.
+The permutation $\sigma()$ of cells sorts them by realized crime rate $g$ from highest to lowest.
+
+$$PEI(A(r)) = \frac{PAI(A(r))}{PAI(A^{*}(r))}$$ PEI is bounded between 0 and 1.
+A PEI value equal to 1 implies perfect prediction.
+
+*Recapture Rate Index* (RRI) measure the predicted number of crimes in $A(r)$ divided by the actual number of crimes.
+
+$$RRI(A(r)) = \frac{ \sum_{i=1}^{r}f(C_i)}{\sum_{i=1}^{r} g(C_i)}$$ $RRI$ is a ratio of the forecasted crimes compared to the actual crimes, so $RRI > 1$ means the model overestimates the crime rate while $RRI < 1$ means the opposite.
+
+$AUC$ curve plots in the unit square the cumulative proportion of crime in $A(r)$ on the vertical axis versus the cumulative proportion of area in $A(r)$ on the horizontal axis.
+The coordinates of the parametric curve are:
+
+$$AUC(A(r)) = \left[ \frac{\sum_{i=1}^{r} f(C_i)}{\sum_{i=1}^{N} f(C_i)}, \frac{\sum_{i=1}^{r} \mu(C_i) }{\sum_{i=1}^{N} \mu(C_i)} \right]$$ An area of the AUC equal to 1.0 implies the model has perfect predictive power, while an area of 0.5 indicates no predictive power.
+
+# Results {#s-results}
+
+## Standard Performance Measures
+
+Random forest and Cubist models show comparable training performance in RMSE (0.80) and $R^2$ (67%) in both 2019 and 2020 as reported in Table \@ref(tab:rmse-results).\
+The `caret` model tuning framework calibrated the optimal random forest model using 10-fold cross-validation by minimizing `RMSE` over a range of parameters for `mtry` (the number of predictors to include at each node of the random forest) and `min.node.size` (minimum terminal node sizes).
+For the Cubist model, `caret` calibrated the optimal Cubist fit over a range of `committees` and `neighbors` using 10-fold cross-validation and minimizing `RMSE`.
+The optimal random forest model had `mtry=14` and `min.node.size=5` while the optimal Cubist model had `committees=10` and no `neighbors`.
+
+In 2019, we see that the test and training performances are similar within model.
+Moreover, training performance is nearly identical between models while test performance diverge slightly.
+
+In 2020, the results looks quite different.\
+While the training performance across models is in light with the previous year's training results, the test performance significantly decreased for both models.
+We see a significant increase in test RMSE and a decline in test $R^2$ for both models.
+For example, Cubist test RMSE jumped up from 0.85 to .90 and $R^2$ declined from 66% to 55%.
+
+```{r rmse-results}
+df_rmse_results = tibble( Model = c("random forest", "cubist", "random forest", "cubist") ,
+                          Period = c( 2019, 2019, 2020, 2020) ,
+                          Train_RMSE = c( .8072, .8035, .8034, .8092 ) ,
+                          Train_Rsq = c( 66.67, 66.68, 68.21, 67.24 ) ,
+                          Test_RMSE  = c( .8209, .8503, .8959, .9035 ) ,
+                          Test_Rsq = c(67.60, 66.40, 55.36, 54.84 )
+                           )
+df_rmse_results %>% kable(caption = "Forecast Results for RMSE and R-squared") %>% 
+  kable_styling(bootstrap_options = c("hover", "striped"), position = "center")
+
+```
+
+## Crime Hotspot Measures
+
+We compared model performances for Period 2019 and 2020 using the PAI, RRI, PEI and AUC metrics for the top 1% of grid cells.
+As shown in Figure \@ref(fig:panel-stats-plot-2018-12-31) for Period 2019 and Figure \@ref(fig:panel-stats-plot-2019-12-31) for Period 2020, PAI for Random Forests (RF) and Cubist (CU) models are comparable and equally effective in highlighting assault hotspots.
+For the top 50 grid cells in each model in 2019, RF PAI was 49.6 while CU PAI was 50.6 (see Table \@ref(tab:PAI-comparison-2019)).
+In 2020, for the top 50, the PAI measures for both fell to 40.9 (RF) and 40.1 (CU) respectively (see Tab \@ref(tab:PAI-comparison-2020)).
+If police are able to deter assaults in those top 50 hotspots, they would eliminate almost 13.5% of assaults for the entire city in 2019.
+
+Using the RRI measure in the top right plots of Figure \@ref(fig:panel-stats-plot-2018-12-31), we see that RF model was closer to 1.0 (the ideal ratio) while CU model was closer to 1.1 for areas greater than 0.5%.
+This means the CU model overestimated assault rates by 10% within the hotspots.
+From Figure \@ref(fig:panel-stats-plot-2019-12-31), we see the RRI measure was higher for both models with RRI closer to 1.4.
+This suggest that both RF and CU models overestimated assaults.
+A reduced assault rate is consistent with a story that people were less active in 2020 due to Covid-19 pandemic related changes in behavior and movement creating few opportunities for assaults.
+
+Looking at the PEI measure in the bottom left plot of Figure \@ref(fig:panel-stats-plot-2018-12-31), the PEI value for the first 25 hotspots starts almost at 1 and gradually declines to 75-80% before increasing back to 88-90% between the top 25-75 hotspots.
+This pattern suggests the models are highly accurate in ranking the topmost hotspots 1-5 but gradually become less precise in the ordering of the next tier 6-25.
+Eventually, the models and the realized hotspots converge in their agreement of the next cohort.
+
+By comparison, in Figure \@ref(fig:panel-stats-plot-2019-12-31), the PEI starts near 0.63 in the 2020 panel and oscillates between .45 and .88 within the top 15 hotspots before stabilizing around 0.75 for hotspot ranks 25.
+This suggests that the models did not anticipate large increases in assaults for certain lower ranking hotspots and sudden reductions in assaults at other hotspots.
+This is consistent with changes in human activity at busy grid cells during 2020.
+
+The outliers are visible in the Predicted vs. Observed scatterplots in, for example, the Cubist model in Figure \@ref(fig:cubist-predobs-2020).
+We see a reduction in the level of PEI of 2019 ( about 83% when cumulative area is 1%) to PEI in 2020 (about 78% at the same cumulative area).
+
+Lastly, the AUC curve shows a slight higher value for RF model over CU model in both test periods.
+RF model had AUC = 89.3% in 2019 versus CU model with AUC = 88.3% in 2019.
+These values drop to RF (88.8%) and CU (87.6%) in 2020 periods.
+
+```{r load-PAI-ranked-grids}
+
+
+PAI_20181231_cu_ranked_grid_file = paste0(included_dir, "EXP_CUBIST_PAI_RANKED_GRID_2018-12-31.geojson")
+
+PAI_20191231_cu_ranked_grid_file = paste0(included_dir, "EXP_CUBIST_PAI_RANKED_GRID_2019-12-31.geojson")
+
+PAI_20181231_rf_ranked_grid_file = paste0(included_dir, "EXP_RANDOMFOREST_PAI_RANKED_GRID_2018-12-31.geojson")
+
+PAI_20191231_rf_ranked_grid_file = paste0(included_dir, "EXP_RANDOMFOREST_PAI_RANKED_GRID_2019-12-31.geojson")
+
+
+PAI_20181231_cu_ranked_grid = sf::st_read(PAI_20181231_cu_ranked_grid_file, quiet = TRUE) %>%  st_transform(2264) 
+
+PAI_20181231_rf_ranked_grid = sf::st_read(PAI_20181231_rf_ranked_grid_file, quiet = TRUE) %>%  st_transform(2264) 
+
+
+PAI_20191231_cu_ranked_grid = sf::st_read(PAI_20191231_cu_ranked_grid_file, quiet = TRUE) %>%  st_transform(2264) 
+
+PAI_20191231_rf_ranked_grid = sf::st_read(PAI_20191231_rf_ranked_grid_file, quiet = TRUE) %>%  st_transform(2264) 
+
+
+
+PAI_20181231_rf_ranked_grid %>% 
+  st_drop_geometry() %>% 
+  select( rank, id_grid, cum_crime_freq,  prop_cum_area, prop_cum_crime_freq , PAI , RRI ) %>% 
+  left_join( PAI_20181231_cu_ranked_grid %>% 
+               st_drop_geometry() %>% 
+               select( rank, id_grid, cum_crime_freq , prop_cum_area, prop_cum_crime_freq, PAI, RRI ), by = "rank") %>%
+  rename( id_grid_rf              = id_grid.x, 
+          cum_crime_freq_rf       = cum_crime_freq.x ,
+          prop_cum_area_rf        = prop_cum_area.x,
+          prop_cum_crime_freq_rf  = prop_cum_crime_freq.x ,
+          PAI_rf                  = PAI.x ,
+          RRI_rf                  = RRI.x ,
+          id_grid_cu              = id_grid.y ,
+          cum_crime_freq_cu       = cum_crime_freq.y ,
+          prop_cum_area_cu        = prop_cum_area.y ,
+          prop_cum_crime_freq_cu  = prop_cum_crime_freq.y ,
+          PAI_cu                  = PAI.y ,
+          RRI_cu                  = RRI.y
+          ) -> PAI_20181231_comparison 
+
+
+PAI_20191231_rf_ranked_grid %>% 
+  st_drop_geometry() %>% 
+  select( rank, id_grid, cum_crime_freq,  prop_cum_area, prop_cum_crime_freq , PAI , RRI ) %>% 
+  left_join( PAI_20191231_cu_ranked_grid %>% 
+               st_drop_geometry() %>% 
+               select( rank, id_grid, cum_crime_freq , prop_cum_area, prop_cum_crime_freq, PAI, RRI ), by = "rank") %>%
+  rename( id_grid_rf              = id_grid.x, 
+          cum_crime_freq_rf       = cum_crime_freq.x ,
+          prop_cum_area_rf        = prop_cum_area.x,
+          prop_cum_crime_freq_rf  = prop_cum_crime_freq.x ,
+          PAI_rf                  = PAI.x ,
+          RRI_rf                  = RRI.x ,
+          id_grid_cu              = id_grid.y ,
+          cum_crime_freq_cu       = cum_crime_freq.y ,
+          prop_cum_area_cu        = prop_cum_area.y ,
+          prop_cum_crime_freq_cu  = prop_cum_crime_freq.y ,
+          PAI_cu                  = PAI.y ,
+          RRI_cu                  = RRI.y
+          ) -> PAI_20191231_comparison 
+
+
+```
+
+```{r PAI-comparison-2019}
+
+PAI_20181231_comparison %>% filter(rank %in% c( 1, 5, 25, 50, 100, 200 )) %>%
+  select( rank, PAI_rf, PAI_cu, cum_crime_freq_rf, cum_crime_freq_cu, prop_cum_crime_freq_rf , prop_cum_crime_freq_cu, prop_cum_area_cu ) %>%
+  mutate( prop_cum_crime_freq_rf = 100 * prop_cum_crime_freq_rf, prop_cum_crime_freq_cu = 100 * prop_cum_crime_freq_cu, prop_cum_area_cu = 100 * prop_cum_area_cu) %>%
+  kable(digits = 2, caption = "Model PAI Comparison Test 2019", 
+        col.names = c("Rank", "RF", "Cubist", "RF", "Cubist", "RF", "Cubist", "Area")) %>%
+  kable_styling(bootstrap_options = c("hover", "striped")) %>%
+  add_header_above(c(" ", "PAI" = 2, "Cum. # Assaults"= 2, "Cum. Assault %"= 2, "Cum. Area%" = 1))
+
+
+```
+
+```{r PAI-comparison-2020}
+
+PAI_20191231_comparison %>% filter(rank %in% c( 1, 5, 25, 50, 100, 200 )) %>%
+  select( rank, PAI_rf, PAI_cu, cum_crime_freq_rf, cum_crime_freq_cu, prop_cum_crime_freq_rf , prop_cum_crime_freq_cu, prop_cum_area_cu ) %>%
+  mutate( prop_cum_crime_freq_rf = 100 * prop_cum_crime_freq_rf, prop_cum_crime_freq_cu = 100 * prop_cum_crime_freq_cu, prop_cum_area_cu = 100 * prop_cum_area_cu) %>%
+  kable(digits = 2, caption = "Model PAI Comparison Test 2020", 
+        col.names = c("Rank", "RF", "Cubist", "RF", "Cubist", "RF", "Cubist", "Area")) %>%
+  kable_styling(bootstrap_options = c("hover", "striped")) %>%
+  add_header_above(c(" ", "PAI" = 2, "Cum. # Assaults"= 2, "Cum. Assault %"= 2, "Cum. Area%" = 1))
+
+
+```
+
+```{r panel-stats-plot-2018-12-31, out.width="90%", fig.align="center", fig.cap="Hotspot Statistics for Period 2019"}
+knitr::include_graphics(c( paste0( included_dir, "EXP_PANEL_STATS_PLOT_2018-12-31.png" ) ) )
+```
+
+```{r panel-stats-plot-2019-12-31, out.width="90%", fig.align="center", fig.cap="Hotspot Statistics for Period 2020"}
+knitr::include_graphics(c( paste0( included_dir, "EXP_PANEL_STATS_PLOT_2019-12-31.png" ) ) )
+```
+
+```{r panel-hotspots-both-models, out.width="95%", fig.align="center", fig.cap="Hotspot Maps for 2019,2020"}
+
+rf2019 <- ggdraw() + draw_image(paste0(included_dir, "EXP_RANDOMFOREST_HOTSPOT_2019_490.png"))
+rf2020 <- ggdraw() + draw_image(paste0(included_dir, "EXP_RANDOMFOREST_HOTSPOT_2019_490.png"))
+cu2019 <- ggdraw() + draw_image(paste0(included_dir, "EXP_CUBIST_HOTSPOT_2019_490.png"))
+cu2020 <- ggdraw() + draw_image(paste0(included_dir, "EXP_CUBIST_HOTSPOT_2019_490.png"))
+
+plot_grid(rf2019, rf2020, cu2019, cu2020, nrow=2)
+```
+
+## Variable Importance
+
+The variable importance plots for the models, shown in Figure \@ref(fig:panel-rf-varimp) and Figure \@ref(fig:panel-cu-varimp), suggest that 4 prior crime rates in the cell are the dominant predictors.
+The longitude and latitude are also important.
+Density, poverty rate, income, unemployment are the next important categories.
+Between test periods and within model, rankings of the predictors are consistent.
+Across models, RF model allocates modest importance to more POI categories, while CU model drops minor POI categories entirely.
+Restaurants, potholes, parks are significant in both models, but pubs are significant only for RF.
+Unfortunately, variable importance plots don't reveal how a predictor affects the response which is why we examine the next two diagnostics.
+
+## Cubist Coefficient Boxplot {#s-cubist-coef-boxplot}
+
+The Cubist model generates hundreds of rule-based linear regression models where each model's domain is a multi-dimensional rectangle in predictor space.
+For a given predictor $X$ which appears in multiple linear models, the parameter coefficients $\beta_1, \beta_2, \ldots$ of $X$ tell us the sensitivity of the response to changes in $X$.
+While individual coefficients may have different magnitudes and even signs, the distribution of all $\beta_i$ may give an idea of the average impact of $X$ on the response.
+The Cubist coefficient boxplot in Figure \@ref(fig:cubist-coef-boxplot-2018-12-31) summarizes the average impact of all relevant predictors by plotting all parameter coefficients used in any of the linear regression models.
+The boxplot for that predictor shows the median and IQR of the distribution of the linear coefficients of the predictor across all its associated linear models.
+The jitter plot behind the boxplot shows the individual points representing those coefficients.
+
+For example, the predictor `school` has almost all negative coefficients.
+We use the median of the distribution of coefficients of the `school` predictor to conclude that overall influence of `school` on assault rate is negative.
+The assault rate is reduced on average when schools exist in the grid cell.
+
+Based on this interpretation of the median, we can infer:
+
+-   `lon`, `lat` implies assault rates are higher in the South East of Raleigh.
+-   `hotel`, `poverty`, `restaurant`, `park` are associated with higher assault rates.
+-   `num_potholes`, `school`, `unemployment_rate` are associated with lower assault rates.
+
+We discuss possible explanations of these predictor interpretation in Section \@ref(s-discussion).
+
+```{r cubist-coef-boxplot-2018-12-31, out.width="90%", fig.align="center", fig.cap="Cubist Coefficient Boxplot Period 2019"}
+knitr::include_graphics(c( paste0( included_dir, "EXP_CUBIST_COEF_BOXPLOT_2018-12-31.png" ) ) )
+```
+
+## Random Forest Conditional Distribution
+
+We ask if the conditional mean number of POIs and the conditional mean of the demographic predictors vary depending on being a hotspot.
+The results are plotted in Figure \@ref(fig:rf-predictors-hotspot-plot-2020) for the RF model in period 2020, but should be similar for other models.
+The blue bar represents the proportion of the conditional mean of each predictor in non-hotspots, while the orange bar represents the proportion of the conditional mean of the predictor in the top 100 hotspots.
+Using `hotel` as an example, the conditional mean number of hotels in the hotspot cells is $m_1 = 0.15$ per cell, while the conditional mean number of hotels in all other cells is $m_2 = 0.0098$.
+The displayed ratio for the orange bar is $m_1/(m_1 + m_2)$ and $m_2/(m_1 + m_2)$ for the blue bar.
+
+Motels, bars, pubs , pharmacies, restaurants and nightclubs are more frequent in hotspots, while bakeries, beauty shops, department stores and playgrounds are more frequent in non-hotspots.
+While imbalances in the conditional mean of predictors may provide insights, for random forests, the difference may not be causal.
+
+## Maps and Rankings
+
+Hotspot prediction models generate maps and rankings which allow the user to glean further insights.
+In Figure \@ref(fig:panel-hotspots-both-models), we show the top 100 hotspot predictions overlaying the Raleigh city base map for both models in both test periods.
+We conclude that the hotspots are relatively stable year over year.
+Moreover, the RF and CU models produce similar predicted locations.
+This further suggests they are both practical hotspot models.
+
+Four interactive leaflet version of these maps is available at Github repository:
+
+-   `CU_POI_Hotspots_20191231.html` contains the Cubist model hotspots with POI, potholes and all grid forecasts for 2020.
+-   `CU_Demographics_Hotspots_20191231.html` contains the Cubist model hotspots and income, poverty and unemployment for 2020.
+-   `RF_POI_Hotspots_20191231.html` contains the Random forest model hotspots with POI, potholes and all grid forecasts for 2020.
+-   `RF_Demographics_Hotspots_20191231.html` contains the Random forest model hotspots and income, poverty and unemployment for 2020.
+
+The utility of a hotspot prediction model will vary with the role of the user.
+A police department may wish to concentrate on the top 20 hotspots in detail and evaluate its practical benefit in relation to existing intelligence and known crime generators.
+A homeowner may wish to evaluate his own neighborhood regardless of the hotspot predictions.
+A homebuyer may examine each potential home's proximity to the nearest hotspots.
+
+Table \@ref(tab:rf-top10-report-2020) contains a representative report of the top 10 hotspots in Raleigh using the RF model for period 2020.
+Using reverse geocoding, we map the center of each grid cell to a street address but note that the stated address need not cause or be the location of the assaults.
+Rather the grid cell consists of the local neighborhood within 245 feet in each compass direction of the stated address.
+
+```{r}
+top10_hotspots = read_rds(paste0(included_dir, "EXP_PAI_RANKED_REVGEOCODE_RANDOMFOREST_2020_TOP10.rds"))
+
+```
+
+```{r rf-top10-report-2020, message = FALSE, error = FALSE, warning=FALSE, out.width='100%' }
+top10_hotspots %>%
+  mutate( pct_assaults = prop_cum_crime_freq * 100 , pct_area = prop_cum_area * 100 ) %>%
+  select(rank, crime_freq,  pct_area, pct_assaults ,address ) %>% 
+  kable(digits = 2, caption = "Top 10 Crime Hotspots: RF Model 2020", 
+        col.names = c("Rank", "#Assaults", "Cum % Area", "Cum %Crime", "Address") ) %>%
+  kable_styling(bootstrap_options = c("hover", "striped" ), position = "left")  %>%
+  column_spec(1:4, width = "0.5in") %>%
+  column_spec(5, width = "3.5in")
+  
+
+```
+
+# Discussion {#s-discussion}
+
+Both models produce crime hotspot forecasts and metrics consistent with prior work in the crime spatial prediction literature.
+The random forest model is a well-established benchmark model in this literature.
+Whereas the Cubist model has not previously been used in this literature, perhaps, due to its previous history as a proprietary software model developed by Quinlan.
+However, the Cubist model is well established in geological and medical studies.
+Our findings suggest that the Cubist model performs well under the PAI metric but less effectively under the RRI, PEI and AUC metrics.
+
+Random forests are subject to the blackbox model critique although variable importance plots and other diagnostic plots help demystify such models somewhat.
+Prior work has shown improved interpretability with Shapley decomposition and average local effects plots [@wheeler_mapping_2020].
+
+However, the Cubist model has two tools as well: the coefficient boxplot demonstrated in \@ref(s-cubist-coef-boxplot) and the rules displays from the software.
+It is possible to display all rules of the form: $$    Y = \beta_{i_1}X_{i_1} + \beta_{i_2}  X_{i_2} + \ldots + \beta_{i_n} X_{i_n} \text{ for points in rectangle } R(j_1, j_2, \ldots, j_M) $$ In principle, the rule-structure allows the analyst to identify all the rules impacting a specific cell grid by comparing its attributes with the rectangles $R(j_1, \ldots, j_M)$.
+
+For example, the boxplot suggests a higher crime rate in SouthEast Raleigh.
+This interpretation is supported by the remarks by the Raleigh Chief of Police @wralWRALSitsRaleigh2021.
+The negative relationship between schools and assaults may be due to greater security presence on campuses and lower probability of serious assaults leading to police reports.
+
+One interesting puzzle is the direction of impact of potholes on assault rates.
+While the variable importance plots suggest potholes have a small impact on assault rates, the random forest conditional mean barplot and Cubist coefficient boxplot appear to give opposite answers.
+The Random Forest plot suggests potholes are roughly three times more prevalent in hotspots than in non-hotspots.
+The Cubist coefficient boxplot suggests the sign of the median impact of potholes is negative.
+Two effects may be at work as acknowledged by @wheelerEffect311Calls2018.
+
+The high presence of potholes in crime hotspots is consistent with a broken windows theory of crime.
+But it is also consistent with hotspots occurring in high traffic areas with greater wear and tear on roads and thus greater prevalence of potholes.  
+
+On the other hand, most potholes occur in non-hotspots and often in residential areas.  The Cubist coefficient boxplot suggests
+potholes have a small but overall negative impact on crime rates.
+Concerned citizens may actively report potholes in order to maintain community appearances, what @wheelerEffect311Calls2018 refers to as "collective efficacy" in the context of 311 calls for service.
+This is consistent with reduced crime rates in areas that enforce community norms.
+The Cubist boxplot can support both interpretations because Figure \@ref(fig:cubist-coef-boxplot-2018-12-31) has positive and negative coefficients.   Moreover, the Cubist rules can tell us which areas of Raleigh have positive or negative directions of impact.
+
+The role of unemployment rate may also give conflicting interpretations of the random forest and Cubist model diagnostics.
+While the Cubist model clearly view unemployment rate tends to lower assault rates, the random forest conditional mean plot shows higher mean unemployment rate in hotspots than non-hotspots.
+We observe one possible explanation is that unemployment (and poverty) rates are higher in college campuses than average.
+However, college campuses have below average rates of assault in Raleigh.
+The Cubist model may be identifying such indirect linkages between predictors and crime rates but more study here seems warranted.
+
+Finally, we illustrate the predictive performance at hotspots in 2020 using the RF model.
+For example, hotspot #8 (geocoded to New Bern Avenue in the Business District) in Table \@ref(tab:rf-top10-report-2020) is far from the civic center.   Hotspot #8 has predicted assault rate of 21.2 in 2020 which is significantly above the city average rate.
+The realized assault rate was 19.   Within the hotspot, we find 2 motels, a fast food restaurant and an automotive service shop and a bus stop.
+These points of interest will increase the level of human traffic.
+However, we do not capture the local impact of nearby POI such as an adjacent church, motel or fast food place across the street as shown in Figure \@ref(fig:rf-hotspot8).
+
+
+```{r rf-hotspot8, out.width="90%", fig.align="center", fig.cap="Hotspot 8 in New Bern Avenue, Business District, Raleigh"}
+knitr::include_graphics(c( paste0( included_dir, "Hotspot8_RF_2020.png" ) ) )
+```
+
+Future directions of study include looking at crime predictive performance at later periods and less frequent crime categories.   In addition, the use of kernel density estimation of local POI and crime generators may improve the predictive accuracy of the model.  We have also restricted the forecast horizon to annual periods to avoid consideration of seasonality and higher frequency forecasts.  In addition, expanding the study to include local adjacent municipalities of Cary, Garner, Apex may yield further predictive insights.
+
+# Conclusion
+
+This study has applied a spatiotemporal approach to studying Raleigh's assault crime data.
+The main findings are:
+
+-   The Cubist model produces comparable PAI, RMSE, $R^2$ to the benchmark random forest model on up to 1% of the city area.
+    It seems to somewhat underperform random forest on other metrics: RRI, PEI and AUC.
+    The random forest model produces hotspot predictions consistent with prior work.
+
+-   The use of the Cubist model in spatial crime prediction does not appear in previous literature.
+    It shows sufficient promise for consideration in future crime machine learning studies.
+    The use of the Cubist coefficient boxplot diagnostic is illustrated in this study.
+
+-   Raleigh's hotspot distribution is consistent with those of larger metropolitan areas.
+
+-   Predictive performance of long term assault crime rates varied significantly between 2019 and 2020.
+    We attribute this variation in performance to changes in social behavior due to social unrest demonstrations and Covid-19 restrictions.
+
+-   Pothole location data appears to provide a small contribution to predictive performance of both models.
+
+
+# References
+
+::: {#refs}
+:::
+
+# Appendices
+
+## Data and Script
+
+The replicable, annotated code in `R` and supporting datasets are available in Github at (<https://github.com/completegraph/Raleigh>).
+
+## Figures
+
+This section includes the following Figures:
+
+-   \@ref(fig:cubist-predobs-2019) Cubist Predicted-Observed Plot 2019
+-   \@ref(fig:cubist-predobs-2020) Cubist Predicted-Observed Plot 2020
+-   \@ref(fig:panel-rf-varimp) Random Forest Variable Importance 2019, 2020
+-   \@ref(fig:panel-cu-varimp) Cubist Variable Importance 2019, 2020
+-   \@ref(fig:rf-predictors-hotspot-plot-2020) Conditional Means in Hotspots RF Model 2020
+
+```{r cubist-predobs-2019, out.width="90%" , fig.align="center", fig.cap = "Cubist Predicted-Observed Plot 2019"}
+knitr::include_graphics(c( paste0( included_dir, "CUBIST_PREDOBS_PLOT_2019.png" ) ) )
+```
+
+```{r cubist-predobs-2020, out.width="90%", fig.align="center", fig.cap="Cubist Predicted-Observed Plot 2020"}
+knitr::include_graphics(c( paste0( included_dir, "CUBIST_PREDOBS_PLOT_2020.png" ) ) )
+```
+
+```{r panel-rf-varimp, out.width="95%", fig.align="center", fig.cap="Random Forest Variable Importance 2019, 2020"}
+
+rf2019vi <- ggdraw() + draw_image(paste0(included_dir, "EXP_RANDOMFOREST_MODEL_VARIMP_2018-12-31.png"))
+rf2020vi <- ggdraw() + draw_image(paste0(included_dir, "EXP_RANDOMFOREST_MODEL_VARIMP_2019-12-31.png"))
+
+plot_grid(rf2019vi, rf2020vi, nrow=1)
+```
+
+```{r panel-cu-varimp, out.width="95%", fig.align="center", fig.cap="Cubist Variable Importance 2019, 2020"}
+
+cu2019vi <- ggdraw() + draw_image(paste0(included_dir, "EXP_CUBIST_MODEL_VARIMP_2018-12-31.png"))
+cu2020vi <- ggdraw() + draw_image(paste0(included_dir, "EXP_CUBIST_MODEL_VARIMP_2019-12-31.png"))
+
+plot_grid(cu2019vi, cu2020vi, nrow=1)
+```
+
+```{r rf-predictors-hotspot-plot-2020, out.height="80%", fig.align="center", fig.cap="Conditional Means in Hotspots RF Model 2020"}
+knitr::include_graphics(c( paste0( included_dir, "EXP_RANDOMFOREST_PREDICTORS_HOTSPLOT_PLOT_2020.png" ) ) )
+```
+
+## Code
+
+R code for exploratory data analysis, model calibration, analysis and map building is available on the Github at (<https://github.com/completegraph/Raleigh>).
+
+The R code for rendering this document is included in the **HTML online version only** located at
+(<https://rpubs.com/Fixed_Point/848730>)
+
+Please note that this R code is for document production only.
+
+```{r ref.label=knitr::all_labels(), echo=params$include_code, eval=FALSE}
+
+```

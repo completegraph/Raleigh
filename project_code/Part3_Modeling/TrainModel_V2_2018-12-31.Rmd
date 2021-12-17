@@ -1,0 +1,756 @@
+---
+title: "Model Building for Crime Prediction 2018-12-31"
+author: "Alexander Ng"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output:
+  html_document:
+    df_print: paged
+    highlight: tango
+    number_sections: yes
+    theme: readable
+    toc: yes
+    toc_depth: 2
+    toc_float: no
+    fontsize: 12
+  pdf_document:
+    toc: yes
+    toc_depth: '2'
+subtitle: Production
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+```{r message=FALSE, warning=FALSE}
+suppressPackageStartupMessages(library(knitr) )
+suppressPackageStartupMessages( library(tidyverse) )
+suppressPackageStartupMessages(library(kableExtra) )
+
+suppressPackageStartupMessages(library(sf))
+suppressPackageStartupMessages(library(caret))
+
+library(ggspatial)
+library(cowplot)
+library(Cubist)
+library(ranger)
+library(cowplot)
+library(skimr)
+library(viridis)
+library(RColorBrewer)
+
+```
+
+# Introduction
+
+The purpose of this script is to fit the Cubist and Random forest models to the training data set and generate predictions on the test data set.
+
+For the training dataset, the response period measures the crime rates for Jan 1, 2019 - Dec 31, 2019.
+We use the `index date` 2018-12-31 to label this script.
+So the index date is the observation date when predictors are known before fitting the model to the training period response.
+
+The `base date` is 2019-12-31 in this document. It is the last date before the start of the test period. For the test dataset, the response period measures the crime rates for Jan 1, 2020 - Dec 31, 2020.
+
+Both models will be fitted on the training dataset to predict the response of the test dataset.
+
+```{r configuration, echo = FALSE}
+
+proj_dir = "/Volumes/GDRIVE_SSD/homes/alex/datascience/698_CAPSTONE_2021_FALL"
+working_dir = paste0(proj_dir, "/", "project_code/Part3_Modeling/")
+data_dir = paste0(proj_dir, "/project_data/")
+
+setwd(working_dir)
+```
+
+```{r echo = TRUE}
+
+grid_cellsize = 490  # Hard-coded
+
+loadRDSModel = TRUE # Skips Cubist Tuning entirely.  If TRUE then tuningFull is not used.
+
+loadRandomForestModel = TRUE  # Skips Random Foret Tuning entirely.  If TRUE then tuningFull is not used.
+
+tuningFull = TRUE   # Tune the model with various calibration (TRUE = takes a long time,  FALSE takes less time)  Only applies if loadRDSModel == TRUE
+
+```
+
+```{r train-load, echo = TRUE}
+
+all_data_on_grid_training_file = paste0(data_dir, "EXP_ALL_DATA_ON_GRID_490_2018-12-31.geojson")
+
+all_data_on_grid_test_file = paste0(data_dir, "EXP_ALL_DATA_ON_GRID_490_2019-12-31.geojson")
+
+```
+
+To generate the training and test data sets, we load the grid files and strip out non-predictor or redundant columns. Since we are predicting crime frequencies, we strip out the crime outs. Since the models don't require the grid geometries, we drop the `geometry` column.
+
+```{r load-all-training-data-on-grid}
+#
+# Load the geojson files
+# change the coordinate system to 2264
+# --------------------------------------------
+all_data_on_grid_train <- sf::st_read(all_data_on_grid_training_file, quiet = TRUE) %>% 
+  st_transform(2264) 
+
+all_vars_on_grid_train = all_data_on_grid_train %>% st_drop_geometry()
+
+X_vars_on_grid_train = all_vars_on_grid_train %>% 
+  select(-id_grid, 
+         -crime_freq, 
+         -crime_count, 
+         -crime_count_1Y, 
+         -crime_count_2Y, 
+         -crime_count_3Y,
+         -crime_count_6M, 
+         -rows, 
+         -cols,
+         -area
+         )
+
+Y_on_grid_train = all_vars_on_grid_train$crime_freq
+```
+
+```{r load-all-test-data-on-grid}
+#
+# Load the geojson files
+# change the coordinate system to 2264
+# --------------------------------------------
+all_data_on_grid_test <- sf::st_read(all_data_on_grid_test_file, quiet = TRUE) %>% 
+  st_transform(2264) 
+
+all_vars_on_grid_test = all_data_on_grid_test %>% st_drop_geometry()
+
+X_vars_on_grid_test = all_vars_on_grid_test %>% 
+  select(-id_grid, 
+         -crime_freq, 
+         -crime_count, 
+         -crime_count_1Y, 
+         -crime_count_2Y, 
+         -crime_count_3Y,
+         -crime_count_6M, 
+         -rows, 
+         -cols,
+         -area
+         )
+
+Y_on_grid_test = all_vars_on_grid_test$crime_freq
+```
+
+# Cubist Model - 2020
+
+We train the Cubist model using `caret` with 10-100 committees and 0-9 neighbors. The selection criteria is the best model based on RMSE.
+
+```{r cubist-tuning, echo = TRUE, warning=FALSE, error = FALSE, message=FALSE}
+
+set.seed( 1027)
+
+cubistControlFull <- trainControl(method = "cv" ,  selectionFunction = "best")
+tuneGridFull  <- expand.grid( committees = c( 10, 50, 100 ) ,
+                              neighbors = c( 0, 1, 5, 9 )
+                                                  ) 
+
+cubistControlLight <- trainControl(method = "cv" ,  selectionFunction = "best", verboseIter = TRUE)
+tuneGridLight <- expand.grid( committees = c( 100 ) , 
+                              neighbors = c( 0  )  )
+
+rdsFileName = "cubistTune_train_2018-12-31.rds"
+
+if(loadRDSModel == FALSE ){
+  
+   if(tuningFull == TRUE)
+   {
+        cubistControl = cubistControlFull
+        cubistGrid = tuneGridFull
+   } else  {
+        cubistControl = cubistControlLight
+        cubistGrid = tuneGridLight
+   }
+
+    (cubistTune = caret::train( x = X_vars_on_grid_train, 
+                          y = Y_on_grid_train , 
+                          method = "cubist",
+                          tuneGrid = cubistGrid ,
+                          verbose = FALSE,
+                          metric = "RMSE" ,
+                          trControl = cubistControl ) )
+  
+    saveRDS(cubistTune, file = rdsFileName)
+  
+} else {
+  
+   cubistTune = readRDS(rdsFileName)
+}
+
+cubistTune
+
+```
+
+```{r cubist-varimp}
+( ggplot(cubistTune) + labs(title="Cubist Model Tuning", subtitle = "Dec 31, 2019 Base Date") -> p_tuning_cubist )
+
+( ggplot(varImp(cubistTune), top = 40) + labs(title = "Cubist Model Variable Importance", subtitle = "Dec 31, 2019 Base Date") -> p_varimp_cubist )
+
+fname1 = paste0(data_dir, "EXP_CUBIST_MODEL_TUNING_2019-12-31.png")
+fname2 = paste0(data_dir, "EXP_CUBIST_MODEL_VARIMP_2019-12-31.png")
+
+cowplot::save_plot(fname1, p_tuning_cubist, base_height = 5)
+cowplot::save_plot(fname2, p_varimp_cubist, base_height = 5)
+
+```
+
+```{r eval=FALSE}
+cubistTune$finalModel$usage %>% arrange( desc(Model+ Conditions)) %>% 
+  kable(caption = "Cubist Predictor Usage") %>% 
+  kable_styling(bootstrap_options = c("hover", "striped"), position = "left")
+
+```
+
+The Cubist dotplot of the splits are not that useful because they take a long time to run.
+
+```{r}
+dotplot( cubistTune$finalModel, 
+         what = "coefs", 
+         between = list(x = 0.2, y = 0.5) , 
+         scales = list(x = list(relation = "free"),  
+                       y = list(cex = 0.25)  ) )
+
+```
+
+```{r cubist-parameter-boxplot}
+cubistTune$finalModel$coefficients %>% 
+  rownames_to_column(var="id") %>% 
+  select(-committee, -rule) %>% 
+  pivot_longer(!id, names_to = "predictor", values_to = "coef" ) %>% 
+  filter( !is.na(coef)) %>% 
+  filter( predictor != '(Intercept)' )  %>%
+  filter(abs(coef) < 30 ) -> coef_piv
+
+coef_piv %>% 
+  ggplot(    aes(x=reorder(predictor, coef, FUN = median, na.rm = TRUE ),  # order the boxplots by median
+        y = coef )) + 
+  geom_jitter(color = "red", size  = 0.2 , alpha = .5, width = 0.2) +
+  geom_boxplot( outlier.shape = NA , alpha = 0.8, position = position_dodge(width = 0.5)) +  # strip out the outliers
+  coord_flip(ylim=c(-10,10)) +
+  labs(title = "Distribution of Coefficients of Predictors", 
+       subtitle = "from Cubist Committee/Rules  Dec 31, 2019 Base Date",
+       x = "Predictors" ,
+       y = "Coefficient in Linear Model"
+       ) -> p_cubist_coefs_boxplots
+
+
+cubist_coefs_boxplot_file = paste0(data_dir, "EXP_CUBIST_COEF_BOXPLOT_2019-12-31.png")
+
+cowplot::save_plot( cubist_coefs_boxplot_file , p_cubist_coefs_boxplots, base_height = 5)
+
+p_cubist_coefs_boxplots
+
+```
+
+Next, we consider the prediction on the test set.
+
+```{r cubist-predict-2019}
+pred_crime_2019 = predict( cubistTune, newdata = X_vars_on_grid_test)  # Base date Dec 31, 2019
+
+(perf_cu = data.frame( modelName = cubistTune$method ,
+                    baseDate  = "2019-12-31" ,
+                     trainRMSE = getTrainPerf(cubistTune)[1,1] ,
+                     trainR2   = getTrainPerf(cubistTune)[1,2] ,
+                     testRMSE  = caret::RMSE( pred_crime_2019,  Y_on_grid_test) ,
+                     testR2    = caret::R2(   pred_crime_2019,  Y_on_grid_test) 
+                     ) ) 
+
+
+```
+
+```{r cubist-2018-2019-comparison}
+
+pred_crime_2018 = predict( cubistTune, newdata = X_vars_on_grid_train )
+
+predobs_df = tibble( id_grid = all_vars_on_grid_train$id_grid ,
+                     train_predicted   = pred_crime_2018 ,
+                     train_observed = all_vars_on_grid_train$crime_freq ,
+                     test_predicted    = pred_crime_2019 ,
+                     test_observed  = all_vars_on_grid_test$crime_freq
+                     )
+```
+
+```{r cubist-2019-2020-predobs-plot}
+predobs_df %>% ggplot(aes(x=train_predicted, y = train_observed)) + 
+  geom_point(color = "red", size = 0.5) + 
+  geom_abline(slope=1,intercept=0, color = "grey") + 
+  theme(aspect.ratio = 1) +
+  labs( y = "Observed Counts/Cell Year", x = "Predicted Counts/Cell Year", 
+        title = "Cubist Model Training 2015-2019", 
+        subtitle = "Crime frequency (annualized) per Grid Cell") -> ptrainCubist
+
+predobs_df %>% ggplot(aes(x=test_predicted, y = test_observed)) + 
+  geom_point(color = "red", size = 0.5) + 
+  geom_abline(slope=1,intercept=0, color = "grey") + 
+  theme(aspect.ratio = 1) +
+  labs( y = "Observed Counts/Cell Year", x = "Predicted Counts/Cell Year", 
+        title = "Cubist Model Test 2020", 
+        subtitle = "Crime frequency (annualized) per Grid Cell") -> ptestCubist
+
+
+( preobs_panel_plot = plot_grid( ptrainCubist, ptestCubist) )
+
+
+predobs_plot_file = paste0(data_dir, "CUBIST_PREDOBS_PLOT_2020", ".png" )
+
+cowplot::save_plot( predobs_plot_file , preobs_panel_plot , base_height = 6 )
+
+```
+
+Let's use PAI and AUC to measure the quality of the hotspot predictions.
+
+```{r cubist-PAI-stats}
+
+all_data_on_grid_test %>% mutate( pred_crime_freq = pred_crime_2019 ) -> PAI_cu_source_grid
+
+PAI_cu_source_grid %>% arrange(desc(pred_crime_freq, area)) %>% 
+  mutate( cum_crime_freq = cumsum( crime_freq), cum_area = cumsum(area) ) %>%
+  mutate( prop_cum_crime_freq = cum_crime_freq / sum(crime_freq),
+          prop_cum_area = cum_area / sum(area) ,
+          PAI = prop_cum_crime_freq / prop_cum_area ,
+          RRI = cumsum(pred_crime_freq)/cum_crime_freq ,
+          rank = row_number() ,
+          hotspot = ifelse( rank <= 100, 1, 0)
+          ) -> PAI_cu_ranked_grid
+
+```
+
+```{r cubist-PEI-stats}
+PAI_cu_best_ranked_grid = PAI_cu_source_grid %>% arrange( desc( crime_freq, area )) %>%
+         mutate(  cum_crime_freq = cumsum( crime_freq), cum_area = cumsum(area) ) %>%
+         mutate(  rank = row_number() ,
+                  prop_cum_crime_freq_best = cum_crime_freq / sum(crime_freq),
+                  prop_cum_area_best = cum_area / sum(area) ,
+                  PAI_best = prop_cum_crime_freq_best / prop_cum_area_best
+                  )
+  
+PEI_cu_grid = PAI_cu_best_ranked_grid %>%  st_drop_geometry() %>% select( id_grid, 
+                                                                          prop_cum_area_best ,
+                                                                          PAI_best, 
+                                                                          rank ) %>%
+  inner_join( PAI_cu_ranked_grid %>% st_drop_geometry() %>% select( id_grid, PAI, RRI, rank), by = "rank")  %>%
+  mutate( PEI = PAI / PAI_best) %>%
+  rename( id_grid_model = id_grid.y , id_grid_best = id_grid.x)
+
+head(PEI_cu_grid)
+
+```
+
+```{r}
+# Diagnostic
+
+PEI_cu_grid %>% filter( prop_cum_area_best < 0.01 ) %>% ggplot() + geom_line( aes(x = prop_cum_area_best, y = PEI ) ) + 
+  labs(title = "PEI of Cubist Model", subtitle = "Base Date Dec 31, 2019")
+
+PAI_cu_ranked_grid %>% filter(prop_cum_area < 0.01 ) %>% ggplot() + geom_line(aes(x = prop_cum_area , y = RRI )) +
+  labs(title = "RRI of Cubist Model", subtitle = "Base Date Dec 31, 2019")
+
+```
+
+
+```{r save-cubist-PAI-ranked-grid}
+
+PAI_cubist_ranked_grid_file = paste0(data_dir, "EXP_CUBIST_PAI_RANKED_GRID_2019-12-31.geojson")
+
+st_write(PAI_cu_ranked_grid ,  dsn = PAI_cubist_ranked_grid_file , delete_dsn = TRUE, quiet = TRUE)
+
+PEI_cubist_csv_grid_file = paste(data_dir, "EXP_CUBIST_PEI_RANKED_CSV_2019-12-31.csv")
+
+readr::write_csv( PEI_cu_grid, PEI_cubist_csv_grid_file, append = FALSE )
+
+```
+
+```{r}
+#
+#  Calculate the AUC using a trapezoidal rule method to approximate the definite integral.
+#
+calc_AUC_PAI <- function(ranked_PAI_grid){
+  
+    # Add a zero for the curve and the interval of integral
+    Q = c( 0, ranked_PAI_grid$prop_cum_crime_freq)
+    T = c( 0, ranked_PAI_grid$prop_cum_area)
+  
+    avgQ = 0.5 * (lag(Q) + Q)[2:length(Q)]
+    dT = (T - lag(T))[2:length(T)]
+
+    AUC = sum(dT * avgQ)
+    return(AUC)
+}
+
+
+```
+
+```{r}
+
+PAI_cu_ranked_grid %>% filter( prop_cum_area < 0.03 ) %>% ggplot() + geom_line(aes( x = rank, y = PAI))
+PAI_cu_ranked_grid  %>% ggplot() + 
+  geom_line(aes( x = prop_cum_area, y = prop_cum_crime_freq)) + 
+  theme(aspect.ratio = 1) + 
+  geom_abline(slope = 1, intercept = 0)
+
+```
+
+
+We can define hotspots as the top 100 grid cells by predicted crime frequency.
+
+```{r map-file-load}
+raleigh_corporate_limits_file = paste0(data_dir, "Corporate_Limits.geojson")
+
+```
+
+```{r load-raleigh-boundary}
+#
+# Load the geojson files
+# change the coordinate system to 2264
+# filter objects that belong to RALEIGHT
+# --------------------------------------------
+gj_raleigh <- sf::st_read(raleigh_corporate_limits_file, quiet = TRUE) %>% 
+  st_transform(2264) %>% 
+  filter( SHORT_NAME == 'RAL' )
+
+gj_raleigh_buffer = st_buffer(gj_raleigh, dist = 100 ) %>% st_union() %>% st_sf() 
+
+print(paste0( "Area in miles^2 of Raleigh Buffered at 100 feet: ", st_area(st_union( gj_raleigh_buffer) ) / ( 5280^2 ) , " miles" ))
+
+```
+
+```{r}
+
+(PAI_cu_ranked_grid %>% filter( rank <=100 ) %>% ggplot() +
+  annotation_map_tile(type="osm", progress = "none", alpha = 0.5 ) +
+  geom_sf( data = gj_raleigh_buffer, fill = "black" , alpha = 0.7) +
+    geom_sf( aes(fill = hotspot , color = "red" ) ,  lwd = 0.5  ) +
+    labs(title = paste0("Top 100 Predicted Hotspots by Cubist 2020"), subtitle = paste0("Resolution ", grid_cellsize ," feet" ) ) +
+  theme(axis.text = element_blank(), axis.ticks = element_blank(), axis.line = element_blank(), axis.title = element_blank(), 
+        legend.position = "none") -> p_hotspot_cubist_map )
+
+hotspot_cubist_map_file = paste0(data_dir, "EXP_CUBIST_HOTSPOT_2020_", grid_cellsize, ".png" )
+
+cowplot::save_plot( hotspot_cubist_map_file, p_hotspot_cubist_map , base_height = 6 )
+
+
+```
+
+# Random Forest Model
+
+Now we evaluate the Random forest predictive accuracy
+
+```{r rf-tuning, echo = TRUE, warning=FALSE, error = FALSE, message=FALSE}
+
+set.seed( 1027)
+
+rfControlFull <- trainControl(method = "cv" ,  selectionFunction = "best", verboseIter = TRUE)
+rfTuneGridFull  <- expand.grid( .mtry = seq(2, 20, by = 4) , .min.node.size = c( 5, 10 ) , .splitrule = "variance"  )
+
+
+rfControlLight <- trainControl(method = "cv" ,  selectionFunction = "best", verboseIter = TRUE)
+rfTuneGridLight  <- expand.grid( .mtry = c(5, 10) , .min.node.size = c(5), .splitrule = "variance" )
+                  
+                                                  
+rfRdsFileName = "randomForestTune_train_2018-12-31.rds"
+
+if(loadRandomForestModel == FALSE ){
+  
+   if(tuningFull == TRUE)
+   {
+        print("tuningFull is TRUE")
+        rfControl = rfControlFull
+        rfGrid    = rfTuneGridFull
+   } else  {
+        print("tuningFull is FALSE")
+        rfControl = rfControlLight
+        rfGrid    = rfTuneGridLight
+   }
+  
+    (randomForestTune = caret::train( x = X_vars_on_grid_train, 
+                          y = Y_on_grid_train , 
+                          method = "ranger",
+                          tuneGrid = rfGrid ,
+                          verbose = FALSE,
+                          metric = "RMSE" ,
+                          importance = "impurity" ,
+                          num.trees = 1000, 
+                          trControl = rfControl ) )
+  
+    saveRDS(randomForestTune, file = rfRdsFileName)
+  
+} else {
+  
+   randomForestTune = readRDS(rfRdsFileName)
+}
+```
+
+The tuning results are shown below. There is not much variation in the MAE or R-Squared after we pick `mtry` greater than 2.
+
+```{r}
+randomForestTune
+```
+
+```{r}
+
+( ggplot(randomForestTune) + labs(title = "Random Forest Tuning", subtitle = "Base Date Dec 31, 2019") -> p_tuning_randomforest )
+```
+
+```{r}
+( ggplot(varImp(randomForestTune) ) + labs(title = "Random Forest Variable Importance", subtitle = "Dec 31, 2019 Base Date") -> p_varimp_randomforest )
+
+```
+
+```{r}
+fname1 = paste0(data_dir, "EXP_RANDOMFOREST_MODEL_TUNING_2019-12-31.png")
+fname2 = paste0(data_dir, "EXP_RANDOMFOREST_MODEL_VARIMP_2019-12-31.png")
+
+cowplot::save_plot(fname1, p_tuning_randomforest, base_height = 5)
+cowplot::save_plot(fname2, p_varimp_randomforest, base_height = 5)
+```
+
+
+```{r randomforest-predict-2019}
+pred_crime_rf_2019 = predict( randomForestTune, newdata = X_vars_on_grid_test)
+
+(perf_rf = data.frame( modelName = randomForestTune$method ,
+                       baseDate = "2019-12-31",
+                     trainRMSE = getTrainPerf(randomForestTune)[1,1] ,
+                     trainR2   = getTrainPerf(randomForestTune)[1,2] ,
+                     testRMSE  = caret::RMSE( pred_crime_rf_2019,  Y_on_grid_test) ,
+                     testR2    = caret::R2(   pred_crime_rf_2019,  Y_on_grid_test) 
+                     ) ) 
+
+```
+
+```{r randomforest-2018-2019-comparison}
+
+pred_crime_rf_2018 = predict( randomForestTune, newdata = X_vars_on_grid_train )
+
+predobs_rf_df = tibble( id_grid        = all_vars_on_grid_train$id_grid ,
+                     train_predicted   = pred_crime_rf_2018 ,
+                     train_observed    = all_vars_on_grid_train$crime_freq ,
+                     test_predicted    = pred_crime_rf_2019 ,
+                     test_observed     = all_vars_on_grid_test$crime_freq
+                     )
+```
+
+```{r randomforest-2019-2020-predobs-plot}
+predobs_rf_df %>% ggplot(aes(x=train_predicted, y = train_observed)) + 
+  geom_point(color = "red", size = 0.5) + 
+  geom_abline(slope=1,intercept=0, color = "grey") + 
+  theme(aspect.ratio = 1) +
+  labs( y = "Observed Counts/Cell Year", x = "Predicted Counts/Cell Year", 
+        title = "Random Forest Training 2016-2019", 
+        subtitle = "Crime frequency (annualized) per Grid Cell") -> ptrainRandomForest
+
+predobs_rf_df %>% ggplot(aes(x=test_predicted, y = test_observed)) + 
+  geom_point(color = "red", size = 0.5) + 
+  geom_abline(slope=1,intercept=0, color = "grey") + 
+  theme(aspect.ratio = 1) +
+  labs( y = "Observed Counts/Cell Year", x = "Predicted Counts/Cell Year", 
+        title = "Random Forest Model Test 2020", 
+        subtitle = "Crime frequency (annualized) per Grid Cell") -> ptestRandomForest
+
+
+(preobs_rf_panel_plot = plot_grid( ptrainRandomForest , ptestRandomForest ) )
+
+predobs_rf_plot_file = paste0(data_dir, "RANDOM_PREDOBS_PLOT_2020", ".png" )
+
+cowplot::save_plot( predobs_rf_plot_file , preobs_rf_panel_plot , base_height = 6 )
+
+```
+
+Let's use PAI and weighted ROC to measure the quality of the hotspot predictions.
+
+```{r randomforest-PAI-stats}
+
+all_data_on_grid_test %>% mutate( pred_crime_freq = pred_crime_rf_2019 ) -> PAI_rf_source_grid
+
+PAI_rf_source_grid %>% arrange(desc(pred_crime_freq, area)) %>% 
+  mutate( cum_crime_freq = cumsum( crime_freq), cum_area = cumsum(area) ) %>%
+  mutate( prop_cum_crime_freq = cum_crime_freq / sum(crime_freq),
+          prop_cum_area = cum_area / sum(area) ,
+          PAI = prop_cum_crime_freq / prop_cum_area ,
+          RRI = cumsum(pred_crime_freq)/cum_crime_freq ,
+          rank = row_number() ,
+          hotspot = ifelse( rank <= 100, 1, 0)
+          ) -> PAI_rf_ranked_grid
+```
+
+
+```{r randomforest-PEI-stats}
+PAI_rf_best_ranked_grid = PAI_rf_source_grid %>% arrange( desc( crime_freq, area )) %>%
+         mutate(  cum_crime_freq = cumsum( crime_freq), cum_area = cumsum(area) ) %>%
+         mutate(  rank = row_number() ,
+                  prop_cum_crime_freq_best = cum_crime_freq / sum(crime_freq),
+                  prop_cum_area_best = cum_area / sum(area) ,
+                  PAI_best = prop_cum_crime_freq_best / prop_cum_area_best
+                  )
+  
+PEI_rf_grid = PAI_rf_best_ranked_grid %>%  st_drop_geometry() %>% select( id_grid, 
+                                                                          prop_cum_area_best ,
+                                                                          PAI_best, 
+                                                                          rank ) %>%
+  inner_join( PAI_rf_ranked_grid %>% st_drop_geometry() %>% select( id_grid, PAI, RRI, rank), by = "rank")  %>%
+  mutate( PEI = PAI / PAI_best) %>%
+  rename( id_grid_model = id_grid.y , id_grid_best = id_grid.x)
+
+head(PEI_rf_grid)
+
+```
+
+
+```{r}
+# Diagnostic
+
+PEI_rf_grid %>% filter( prop_cum_area_best < 0.01 ) %>% ggplot() + geom_line( aes(x = prop_cum_area_best, y = PEI ) ) + 
+  labs(title = "PEI of Random Forest Model", subtitle = "Base Date Dec 31, 2019")
+
+
+PAI_rf_ranked_grid %>% filter(prop_cum_area < 0.01 ) %>% ggplot() + geom_line(aes(x = prop_cum_area , y = RRI )) +
+  labs(title = "RRI of Random Forest Model", subtitle = "Base Date Dec 31, 2019")
+
+```
+
+```{r save-randomforest-PAI-ranked-grid}
+
+PAI_rf_ranked_grid_file = paste0(data_dir, "EXP_RANDOMFOREST_PAI_RANKED_GRID_2019-12-31.geojson")
+
+st_write(PAI_rf_ranked_grid ,  dsn = PAI_rf_ranked_grid_file , delete_dsn = TRUE, quiet = TRUE)
+
+
+PEI_rf_csv_grid_file = paste(data_dir, "EXP_RANDOMFOREST_PEI_RANKED_CSV_2019-12-31.csv")
+
+readr::write_csv( PEI_rf_grid, PEI_rf_csv_grid_file, append = FALSE )
+
+
+```
+
+```{r}
+# Diagnostic
+
+PAI_rf_ranked_grid %>% filter( prop_cum_area < 0.03 ) %>% ggplot() + geom_line(aes( x = rank, y = PAI)) + labs(title = "Random Forest PAI - 2020")
+PAI_rf_ranked_grid  %>% ggplot() + geom_line(aes( x = prop_cum_area, y = prop_cum_crime_freq)) + theme(aspect.ratio = 1) + geom_abline(slope = 1, intercept = 0) + labs(title = "AUC Random Forest 2020")
+
+```
+
+```{r}
+
+(PAI_rf_ranked_grid %>% filter( rank <=100 ) %>% ggplot() +
+  annotation_map_tile(type="osm", progress = "none", alpha = 0.5 ) +
+  geom_sf( data = gj_raleigh_buffer, fill = "black" , alpha = 0.7) +
+    geom_sf( aes(fill = hotspot , color = "red" ) ,  lwd = 0.5  ) +
+    labs(title = paste0("Top 100 Predicted Hotspots by Random Forest 2020"), subtitle = paste0("Resolution ", grid_cellsize ," feet" ) ) +
+  theme(axis.text = element_blank(), axis.ticks = element_blank(), axis.line = element_blank(), axis.title = element_blank(), 
+        legend.position = "none") -> p_hotspot_randomforest_map )
+
+hotspot_randomforest_map_file = paste0(data_dir, "EXP_RANDOMFOREST_HOTSPOT_2020_", grid_cellsize, ".png" )
+
+
+cowplot::save_plot( hotspot_randomforest_map_file, p_hotspot_randomforest_map , base_height = 6 )
+
+
+```
+
+```{r}
+
+# Diagnostic
+
+PAI_rf_ranked_grid %>% 
+  st_drop_geometry() %>% 
+  select( rank, id_grid, cum_crime_freq,  prop_cum_area, prop_cum_crime_freq , PAI , RRI ) %>% 
+  left_join( PAI_cu_ranked_grid %>% 
+               st_drop_geometry() %>% 
+               select( rank, id_grid, cum_crime_freq , prop_cum_area, prop_cum_crime_freq, PAI, RRI ), by = "rank") %>%
+  rename( id_grid_rf              = id_grid.x, 
+          cum_crime_freq_rf       = cum_crime_freq.x ,
+          prop_cum_area_rf        = prop_cum_area.x,
+          prop_cum_crime_freq_rf  = prop_cum_crime_freq.x ,
+          PAI_rf                  = PAI.x ,
+          RRI_rf                  = RRI.x ,
+          id_grid_cu              = id_grid.y ,
+          cum_crime_freq_cu       = cum_crime_freq.y ,
+          prop_cum_area_cu        = prop_cum_area.y ,
+          prop_cum_crime_freq_cu  = prop_cum_crime_freq.y ,
+          PAI_cu                  = PAI.y ,
+          RRI_cu                  = RRI.y
+          ) -> PAI_comparison 
+
+PAI_comparison %>% head(n=10) %>% kable(digits = 3, caption = "Comparison of Random Forest and Cubist Models") %>%
+  kable_styling(bootstrap_options = c("hover", "striped"), position = "left")
+
+```
+
+# Model Comparison
+
+
+```{r}
+# Diagnostic
+
+PEI_rf_grid %>% filter( prop_cum_area_best < 0.01 ) %>% ggplot() + geom_line( aes(x = prop_cum_area_best, y = PEI , col = "Random Forest") ) +  geom_line(data = (PEI_cu_grid %>% filter( prop_cum_area_best < 0.01 ) ), aes( x= prop_cum_area_best , y = PEI , col = "Cubist") ) +
+  scale_color_manual(values = c("Random Forest"= "blue", "Cubist"= "red")) +
+  labs(title = "Predictive Efficiency Index of Models", subtitle = "Base Date Dec 31, 2019", col = "Models", x = "Proportion of Cumulative Area") -> p_PEI
+
+
+PAI_rf_ranked_grid %>% filter(prop_cum_area < 0.01 ) %>% ggplot() + geom_line(aes(x = prop_cum_area , y = RRI , col = "Random Forest")) +
+  geom_line(data = (PAI_cu_ranked_grid %>% filter( prop_cum_area < 0.01) ), aes( x= prop_cum_area , y = RRI , col = "Cubist") ) +
+  scale_color_manual(values = c("Random Forest"= "blue", "Cubist"= "red")) +
+  labs(title = "Recapture Rate Index of Models", subtitle = "Base Date Dec 31, 2019", col = "Models", x = "Proportion of Cumulative Area") -> p_RRI
+
+
+PAI_rf_ranked_grid %>% filter(prop_cum_area < 0.01 ) %>% ggplot() + geom_line(aes(x = rank , y = PAI , col = "Random Forest")) +
+  geom_line(data = (PAI_cu_ranked_grid %>% filter( prop_cum_area < 0.01) ), aes( x= rank , y = PAI , col = "Cubist") ) +
+  scale_color_manual(values = c("Random Forest"= "blue", "Cubist"= "red")) +
+  labs(title = "Predictive Accuracy Index of Models", subtitle = "Base Date Dec 31, 2019", col = "Models") -> p_PAI
+
+PAI_rf_ranked_grid  %>% ggplot() + geom_line(aes(x = prop_cum_area , y = prop_cum_crime_freq , col = "Random Forest")) +
+  geom_line(data = PAI_cu_ranked_grid , aes( x= prop_cum_area , y = prop_cum_crime_freq , col = "Cubist") ) +
+  scale_color_manual(values = c("Random Forest"= "blue", "Cubist"= "red")) +
+  geom_abline(slope = 1, intercept = 0) + theme(aspect.ratio = 1) +
+  labs(title = "AUC of Models", subtitle = "Base Date Dec 31, 2019", col = "Models") -> p_AUC
+
+( p_panel_stats = plot_grid(p_PAI, p_RRI, p_PEI, p_AUC, ncol = 2 ) )
+
+
+panel_stats_plot_file = paste0(data_dir, "EXP_PANEL_STATS_PLOT_2019-12-31", ".png" )
+
+cowplot::save_plot( panel_stats_plot_file  , p_panel_stats , base_height = 6 )
+
+
+```
+
+
+
+
+```{r}
+
+print(paste0("AUC for Cubist Model is: ", AUC_Cubist = calc_AUC_PAI(PAI_cu_ranked_grid ) ) )
+print(paste0("AUC for Random Forest is: ", AUC_Randomforest = calc_AUC_PAI(PAI_rf_ranked_grid ) ))
+
+
+```
+
+
+
+```{r}
+PAI_comparison %>% filter(rank %in% c( 1, 5, 25, 100, 200 )) %>%
+  select( rank, PAI_rf, PAI_cu, cum_crime_freq_rf, cum_crime_freq_cu, prop_cum_crime_freq_rf , prop_cum_crime_freq_cu, prop_cum_area_cu ) %>%
+  mutate( prop_cum_crime_freq_rf = 100 * prop_cum_crime_freq_rf, prop_cum_crime_freq_cu = 100 * prop_cum_crime_freq_cu, prop_cum_area_cu = 100 * prop_cum_area_cu) %>%
+  kable(digits = 2, caption = "Model PAI Comparison Test 2020", 
+        col.names = c("Rank", "RF", "Cubist", "RF", "Cubist", "RF", "Cubist", "Area")) %>%
+  kable_styling(bootstrap_options = c("hover", "striped")) %>%
+  add_header_above(c(" ", "PAI" = 2, "Cum. # Assaults"= 2, "Cum. Assault %"= 2, "Cum. Area%" = 1))
+
+
+```
+
+```{r}
+perf_models =  rbind( perf_rf , perf_cu ) 
+
+perf_model_stats_file = paste0(data_dir, "EXP_MODEL_PERFORMANCE_STATS_2019-12-31.csv")
+
+perf_models %>% write_csv( perf_model_stats_file,  append = FALSE )
+
+```
+
+

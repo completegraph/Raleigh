@@ -1,0 +1,44 @@
+{
+    "release": {
+        "id": "acs2019_5yr",
+        "years": "2015-2019",
+        "name": "ACS 2019 5-year"
+    },
+    "tables": {
+        "B23025": {
+            "title": "Employment Status for the Population 16 Years and Over",
+            "universe": "Population 16 Years and Over",
+            "denominator_column_id": "B23025001",
+            "columns": {
+                "B23025001": {
+                    "name": "Total:",
+                    "indent": 0
+                },
+                "B23025002": {
+                    "name": "In labor force:",
+                    "indent": 1
+                },
+                "B23025003": {
+                    "name": "Civilian labor force:",
+                    "indent": 2
+                },
+                "B23025004": {
+                    "name": "Employed",
+                    "indent": 3
+                },
+                "B23025005": {
+                    "name": "Unemployed",
+                    "indent": 3
+                },
+                "B23025006": {
+                    "name": "Armed Forces",
+                    "indent": 2
+                },
+                "B23025007": {
+                    "name": "Not in labor force",
+                    "indent": 1
+                }
+            }
+        }
+    }
+}

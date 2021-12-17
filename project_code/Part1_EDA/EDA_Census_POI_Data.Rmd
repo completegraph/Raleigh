@@ -1,0 +1,539 @@
+---
+title: "PART 1: EDA of Census Data and POI"
+author: "Alexander Ng"
+date: "11/25/2021"
+output: 
+  html_document:
+    df_print: paged
+    highlight: tango
+    number_sections: yes
+    theme: readable
+    toc: yes
+    toc_depth: 2
+    toc_float: no
+    fontsize: 12
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+This module extracts and describes the Census data and Points of Interest to be used for Model Evaluation.
+
+The raw data files were downloaded in geojson format from the American Community Survey 2019 - 5 year survey.
+The ultimate data source is the US Census Bureau.  The data distributor is censusreporter.org
+
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(kableExtra)
+library(sf)
+library(stars)
+library(ggplot2)
+library(cowplot)
+library(ggspatial)
+library(viridis)
+library(leaflet)
+library(classInt)
+library(RColorBrewer)
+```
+
+```{r echo=FALSE}
+root_dir = "/Volumes/GDRIVE_SSD/homes/alex/datascience/698_CAPSTONE_2021_FALL/"
+
+data_dir = paste0(root_dir , "project_data/")
+
+working_dir = paste0(root_dir, "project_code/Part1_EDA/")
+
+```
+
+
+# City Limits
+
+Let's load the Raleigh Corporate Limits.   By superimposing the city limits with census data, we can verify that the city is fully covered by the latter.
+
+
+```{r map-file-load}
+raleigh_corporate_limits_file = paste0(data_dir, "Corporate_Limits.geojson")
+
+
+# Load the geojson files
+# change the coordinate system to 2264
+# filter objects that belong to RALEIGHT
+# --------------------------------------------
+gj_raleigh <- sf::st_read(raleigh_corporate_limits_file, quiet = TRUE) %>% 
+  st_transform(2264) %>% 
+  filter( SHORT_NAME == 'RAL' )
+
+un_raleigh_buffer = st_buffer(gj_raleigh, dist = 100 ) %>% st_union() %>% st_sf()
+
+```
+
+
+# Poverty Status (B17017)
+
+Load the poverty geojson census data.
+
+```{r}
+pov_root = "acs2019_5yr_B17017_15000US371830529022"
+
+poverty_B17017_raw = st_read( paste0(data_dir, pov_root, "/", pov_root, ".geojson" )
+                                     , quiet = TRUE ) %>% st_transform(2264)
+```
+
+Extract the regional average poverty rate.
+
+```{r}
+regional_avg_poverty_rate = poverty_B17017_raw %>% 
+  filter( geoid == "31000US39580") %>% 
+  mutate( rate = B17017002 / B17017001)  %>% 
+  pull(rate)
+
+```
+
+Impute any missing poverty rate regions with the median rate for the entire Raleigh-Cary Metro Area.
+
+```{r}
+
+poverty_B17017_raw %>% 
+  select( geoid, name, B17017001, B17017002 ) %>% 
+  filter( name  != 'Raleigh-Cary, NC Metro Area')  %>% 
+  mutate( poverty_rate = ifelse( B17017001 == 0, regional_avg_poverty_rate , B17017002 / B17017001) )  %>% 
+  mutate( area = st_area(.)) -> gj_poverty
+
+```
+
+
+
+
+```{r}
+
+pal_fun = colorQuantile("Spectral", NULL , n = 6)
+
+gj_poverty_leaf = st_transform(gj_poverty, 4326)
+
+p_popup <- paste0("Poverty: ", format(round(gj_poverty$poverty_rate, 3), nsmall = 3 ), "<br>" ,
+                  "Name: ", gj_poverty$name , "<br>" ,
+                  "Geoid: ", gj_poverty$geoid, "<br>" )
+                  
+
+# get quantile breaks. Add .00001 offset to catch the lowest value
+breaks_qt <- classIntervals(c(min(gj_poverty$poverty_rate) - .00001, 
+                              gj_poverty$poverty_rate), n = 6, style = "quantile")
+
+breaks_qt
+```
+
+```{r}
+
+leaflet( gj_poverty_leaf ) %>% addPolygons( stroke = FALSE, # Remove polygon borders
+                                                 fillColor = ~pal_fun(poverty_rate),  # set fill color with function from above and value
+                                                 fillOpacity = 0.5 ,
+                                                 smoothFactor = 0.5, # make it nicer
+                                                 popup = p_popup
+                                                 ) %>% addTiles() %>%
+       addLegend( "bottomright", # Location
+                    colors = brewer.pal(6, "Spectral") ,
+                  labels = paste0("up to ", format(breaks_qt$brks[-1], digits = 2)) ,
+                  title = "Raleigh Poverty rate by Census Block Group"
+                  )
+ 
+
+```
+
+
+# Unemployment (B23025)
+
+Table `B23025` contains Employment Status for the Population 16 years and over.   The relevant field is `Unemployed %` from the civilian labor force.
+
+
+```{r}
+
+unemp_root = "acs2019_5yr_B23025_15000US371830529022"
+
+unemp_B23025_raw = st_read( paste0(data_dir, unemp_root, "/", unemp_root, ".geojson" )
+                                     , quiet = TRUE ) %>% st_transform(2264)
+```
+
+
+Extract the regional average unemployment rate for imputation of regions with undefined unemployment rates.
+
+```{r}
+regional_avg_unemp_rate  = unemp_B23025_raw %>% 
+  filter( geoid == "31000US39580") %>% 
+  mutate( rate = B23025005 / B23025001)  %>% 
+  pull( rate )
+
+```
+
+Impute any missing poverty rate regions with the median rate for the entire Raleigh-Cary Metro Area.
+
+```{r}
+
+unemp_B23025_raw %>% 
+  select( geoid, name, B23025005, B23025001 ) %>% 
+  filter( name  != 'Raleigh-Cary, NC Metro Area')  %>% 
+  mutate( unemployment_rate = ifelse( B23025001  == 0, regional_avg_unemp_rate , B23025005 / B23025001) )  %>% 
+  mutate( area = st_area(.)) -> gj_unemp
+
+```
+
+
+```{r}
+
+gj_unemp_leaf = st_transform(gj_unemp, 4326)
+
+p_popup <- paste0("Unemp: ", format(round(100 * gj_unemp$unemployment_rate, 1), nsmall = 1 ), "<br>" ,
+                  "Name: ", gj_unemp$name , "<br>" ,
+                  "Geoid: ", gj_unemp$geoid, "<br>" )
+                  
+
+# get quantile breaks. Add .00001 offset to catch the lowest value
+breaks_qt <- classIntervals(c(min(gj_unemp$unemployment_rate) - .00001, 
+                              gj_unemp$unemployment_rate), n = 6, style = "quantile")
+
+breaks_qt
+```
+
+
+```{r}
+
+leaflet( gj_unemp_leaf ) %>% addPolygons( stroke = FALSE, # Remove polygon borders
+                                                 fillColor = ~pal_fun(unemployment_rate),  # set fill color with function from above and value
+                                                 fillOpacity = 0.5 ,
+                                                 smoothFactor = 0.5, # make it nicer
+                                                 popup = p_popup
+                                                 ) %>% addTiles() %>%
+       addLegend( "bottomright", # Location
+                    colors = brewer.pal(6, "Spectral") ,
+                  labels = paste0("up to ", format(breaks_qt$brks[-1], digits = 2)) ,
+                  title = "Raleigh Unemployment By Block Group"
+                  )
+ 
+
+```
+
+
+
+```{r eval = FALSE}
+ggplot() + geom_sf(data=gj_unemp , aes( fill = unemployment_rate  )  ) +
+  scale_fill_viridis_c( alpha = .4) +
+  annotation_map_tile(type="osm", progress = "none", alpha = 0.5 ) 
+
+```
+
+# Household Income (B19013)
+
+
+Table `B19013` contains Median Household Income .   The relevant field is `Unemployed %` from the civilian labor force.
+
+
+```{r}
+
+#income_root = "acs2019_5yr_B19013_15000US371830523011"   # Smaller Income region
+
+income_root = "acs2019_5yr_B19013_15000US371830529022"   # Larger Income region
+
+
+income_B19013_raw = st_read( paste0(data_dir, income_root, "/", income_root, ".geojson" )
+                                     , quiet = TRUE ) %>% st_transform(2264)
+```
+
+
+Extract the regional average unemployment rate for imputation of regions with undefined unemployment rates.
+
+```{r}
+regional_avg_income  = 67266  # Median household income for Raleigh city in 2019 inflated adjusted dollars
+
+```
+
+
+Impute any missing median household income with the regional median household income for the entire Raleigh-Cary Metro Area.
+
+```{r}
+
+income_B19013_raw %>%  select( geoid, name, B19013001 ) %>% 
+# filter( str_length(geoid) == 19 ) %>%  # Filter out the higher level aggregate regions shown by shorter geoid like Cary, NC, Raleigh, NC, etc.
+ mutate( income = ifelse( is.na(B19013001) | B19013001  == 0, regional_avg_income , B19013001) )  %>% 
+ mutate( area = st_area(.)) -> gj_income
+
+```
+
+
+```{r}
+
+gj_income_leaf = st_transform(gj_income, 4326)
+
+p_popup <- paste0("Income: $", format(round( gj_income$income, 0), nsmall = 0 ), "<br>" ,
+                  "Name: ", gj_income$name , "<br>" ,
+                  "Geoid: ", gj_income$geoid, "<br>" )
+                  
+
+# get quantile breaks. Add .00001 offset to catch the lowest value
+breaks_qt <- classIntervals(c(min(gj_income$income) - .00001, 
+                              gj_income$income), n = 6, style = "quantile")
+
+breaks_qt
+```
+
+
+
+```{r}
+
+leaflet( gj_income_leaf ) %>% addPolygons( stroke = FALSE, # Remove polygon borders
+                                                 fillColor = ~pal_fun(income),  # set fill color with function from above and value
+                                                 fillOpacity = 0.5 ,
+                                                 smoothFactor = 0.5, # make it nicer
+                                                 popup = p_popup
+                                                 ) %>% addTiles() %>%
+       addLegend( "bottomright", # Location
+                    colors = brewer.pal(6, "Spectral") ,
+                  labels = paste0("up to ", format(breaks_qt$brks[-1], digits = 2)) ,
+                  title = "Raleigh Median Household Income"
+                  )
+ 
+
+```
+
+
+# Population Density
+
+
+Table `B01003` contains Population.   The relevant field is `B01003001` which is the total population of the census block group or region.
+
+
+```{r}
+
+pop_root = "acs2019_5yr_B01003_15000US371830529022"   # Larger Population region
+
+
+pop_B01003_raw = st_read( paste0(data_dir, pop_root, "/", pop_root, ".geojson" )
+                                     , quiet = TRUE ) %>% st_transform(2264)
+```
+
+
+There are no missing values in the Total Population table for any block group or region, so we will be able to define a population density as total population per square mile.
+
+```{r}
+
+pop_B01003_raw %>%  select( geoid, name, B01003001 ) %>% 
+ mutate( population = ifelse( is.na(B01003001) , 0 , B01003001) )  %>% 
+ mutate( area = st_area(.)) %>% 
+ mutate( density = population / ( area / (5280^2 ) ) )    -> gj_pop
+
+```
+
+
+
+```{r}
+
+gj_pop_leaf = st_transform(gj_pop, 4326)
+
+p_popup <- paste0("Density: $", format(round( gj_pop$density, 0), nsmall = 0 ), "<br>" ,
+                  "Name: ", gj_pop$name , "<br>" ,
+                  "Geoid: ", gj_pop$geoid, "<br>" )
+                  
+```
+
+
+# Checking Containment and Validity
+
+First, we do a visual inspection using leaflet to ensure Raleigh is inside the census region.
+Then, we'll run formal checks using `st_contains` for containment of the city in each census region
+and `st_crosses` to confirm census regions have no overlapping areas.
+
+The plot below examines Raleigh and median household income region.
+
+```{r}
+
+leaflet( gj_income_leaf ) %>% 
+  addPolygons( data = gj_raleigh %>% st_transform( 4326 ) , weight = 2, color = "red", opacity = 0.8) %>%
+  addPolygons( stroke = FALSE, # Remove polygon borders
+                                                 fillColor = ~pal_fun(income),  # set fill color with function from above and value
+                                                 fillOpacity = 0.5 ,
+                                                 smoothFactor = 0.5, # make it nicer
+                                                 popup = p_popup
+                                                 )  %>%
+                              addTiles() %>%
+       addLegend( "bottomright", # Location
+                    colors = brewer.pal(6, "Spectral") ,
+                  labels = paste0("up to ", format(breaks_qt$brks[-1], digits = 2)) ,
+                  title = "Raleigh Median Household Income"
+                  )
+ 
+
+```
+
+We conclude Raleigh region is visually contained in the income region.
+
+To do the next checks, we form a single multipolygon from the city `sf` object using `st_union` and likewise for the income data.
+
+
+```{r}
+
+un_raleigh = st_union(gj_raleigh)
+un_income = st_union( gj_income)
+```
+
+Check the city has no area outside the income census region.  Area should be zero or empty.
+
+```{r}
+# st_difference is asymmetric.  We check if the city has any area outside the census attribute partition.
+# If there is no area, st_area should not compute a positive area.
+st_area( st_difference( un_raleigh, un_income))
+```
+
+Another check the income region contains the city.  
+```{r}
+# another check that census attribution partition wholly contains the city region
+lengths( st_contains( un_income, un_raleigh ) )  > 0 
+```
+
+Next, check the census region is a proper 2-dimensional partition with no overlapping interiors.
+This ensures that grid cells have well-defined census attribute based on 1 or more block group areas.
+Answer should be `FALSE`.
+
+```{r}
+# The next line checks if any polygons in the sf table of the census attribute partition
+# have overlapping 2-dimensional interiors. (st_crosses)
+# lengths() - returns a list of length 0 or more corresponding to indices of polygons where intersection occurs
+# lengths( x ) > 0 return a list checking if any list is length > 0 iff st_crosses returns no interior intersections
+# any() scans the entire list of TRUE/FALSE for TRUE
+
+any( lengths(st_crosses( gj_income) ) > 0  )  
+
+```
+
+Let's check poverty.  
+
+```{r}
+
+un_poverty = st_union(gj_poverty)
+
+st_area( st_difference(un_raleigh, un_poverty))
+
+lengths(st_contains(un_poverty, un_raleigh) ) > 0 
+
+
+```
+We conclude Raleigh region is entirely contained in the poverty region.
+
+Let's confirm no overlap in the poverty `sf` region. Answer should be `FALSE`.
+
+```{r}
+any( lengths(st_crosses( gj_poverty) ) > 0  )
+```
+
+
+Let's check Raleigh is contained inside the unemployment data region.
+
+```{r}
+un_unemployment = st_union( gj_unemp)
+
+st_area( st_difference(un_raleigh, un_unemployment))
+
+lengths( st_contains(un_unemployment , un_raleigh) ) > 0 
+
+
+
+```
+
+We confirm that.  Finally, let's confirm no overlap in the `sf` unemployment region below.
+
+```{r}
+any( lengths(st_crosses( gj_unemp) ) > 0  )
+```
+
+
+
+
+
+
+
+# POI DATA
+
+```{r}
+
+poi_root = "north-carolina-latest-free.shp"
+
+
+pois_free_raw = st_read( paste0(data_dir, poi_root, "/", "gis_osm_pois_free_1", ".shp" )
+                                     , quiet = TRUE ) %>% st_transform(2264)
+
+
+pois_a_free_raw = st_read( paste0(data_dir, poi_root, "/", "gis_osm_pois_a_free_1", ".shp" )
+                                     , quiet = TRUE ) %>% st_transform(2264)
+
+```
+
+Use the bounding box of Raleigh to reduce the size of the POI dataset.
+
+```{r}
+
+bbox_raleigh_buffer = st_bbox(un_raleigh_buffer) %>% st_as_sfc() %>% st_transform(2264) # make a simple rectangle.
+
+pois_free_raw[ bbox_raleigh_buffer, ] -> bb_pois_raleigh
+
+pois_a_free_raw[ bbox_raleigh_buffer, ] -> bb_pois_a_raleigh
+```
+
+Now, use spatial intersection of the POI data with the Raleigh city buffered boundary to obtain the POIs within the city.
+
+```{r}
+
+pois_raleigh = bb_pois_raleigh %>% st_intersection(un_raleigh_buffer)
+
+pois_a_raleigh = bb_pois_a_raleigh %>% st_intersection(un_raleigh_buffer)
+
+```
+
+```{r eval=TRUE, message = FALSE, error = FALSE}
+
+# Note that sf guesses the format of the output file from the suffix.
+
+st_write(pois_raleigh ,  dsn = paste0(data_dir, "EXP_POIS_RALEIGH.geojson"), delete_dsn = TRUE)
+
+st_write(pois_a_raleigh ,  dsn = paste0(data_dir, "EXP_POIS_A_RALEIGH.geojson"), delete_dsn = TRUE)
+
+```
+
+```{r out.width="100%"}
+
+pois_free_bbox_leaf = bb_pois_raleigh %>% st_transform(4326)
+
+coords = st_coordinates(pois_free_bbox_leaf)
+
+lat = coords[,2]
+long = coords[,1]
+
+leaflet( pois_free_bbox_leaf) %>% 
+  addPolygons( data = gj_raleigh %>% st_transform( 4326 ) , weight = 2, color = "red", opacity = 0.5) %>%
+                              addTiles() %>%
+   addMarkers( data = pois_free_bbox_leaf,  popup = pois_free_bbox_leaf$fclass,  lng = long , lat = lat )
+
+
+```
+
+Let's evaluate the frequency table of the most common POIs for point objects.
+
+```{r}
+pois_raleigh %>% group_by( fclass) %>% summarize( ct = n()) %>% st_drop_geometry() %>% arrange( desc(ct)) %>%
+  top_n( n = 30 )  %>%  ggplot( aes( x = reorder(fclass, ct),  y = ct)) + 
+  geom_bar(stat = "identity") + coord_flip() + labs( x = "fclass", y = "Count", title = "Points of Interest in Raleigh" ) -> p1
+  
+
+pois_a_raleigh %>% group_by( fclass) %>% summarize( ct = n()) %>% st_drop_geometry() %>% arrange( desc(ct)) %>%
+  top_n( n = 30 )  %>%  ggplot( aes( x = reorder(fclass, ct),  y = ct)) + 
+  geom_bar(stat = "identity") + coord_flip() + labs( x = "fclass", y = "Count", title = "Areas of Interest in Raleigh" ) -> p2
+  
+plot_grid(p1, p2)
+
+```
+
+```{r}
+pois_a_raleigh %>% filter( fclass == 'pitch') %>% mutate( area = st_area(.)) %>% st_drop_geometry() %>% View()
+
+```
