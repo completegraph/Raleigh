@@ -35,9 +35,9 @@ This project uses `R` for computation and analysis.
   
 ## Results
 
-   The HTML version of the paper is ![](https://rpubs.com/Fixed_Point/848730)
+   The HTML version of the paper is ![RPubs](https://rpubs.com/Fixed_Point/848730)
 
-   A Youtube video over of the project is at:  ![](https://youtu.be/AWwT57oYL1U)
+   A Youtube video over of the project is at:  ![Video](https://youtu.be/AWwT57oYL1U)
 
    Interactive maps are contained in 
    
