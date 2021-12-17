@@ -1,6 +1,8 @@
-# ![Raleigh](project_code/Part6_Paper/included/EXP_RALEIGH_PLOT_GRID_4000.png)
 
 # Predicting Crime Hotspots with Cubist and Random Forests
+
+# ![Raleigh](project_code/Part6_Paper/included/EXP_RALEIGH_PLOT_GRID_4000.png)
+
 
 ## Introduction
 
