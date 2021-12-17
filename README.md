@@ -39,7 +39,7 @@ This project uses `R` for computation and analysis.
 
    A Youtube video over of the project is at:  [Video](https://youtu.be/AWwT57oYL1U)
 
-   Interactive maps are contained in 
+   Interactive maps are available in the repo for download.
    
 *   project_data/CU_Demographics_Hotspots_20191231.html
 *   project_data/CU_POI_Hotspots_20191231.html
